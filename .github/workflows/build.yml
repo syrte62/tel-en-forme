@@ -1,0 +1,43 @@
+name: Construire l'APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compiler
+        run: gradle --no-daemon assembleDebug
+
+      - name: Renommer l'APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk TelEnForme.apk
+
+      - name: Publier en téléchargement direct (onglet Releases)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" TelEnForme.apk \
+            --title "Tél en forme $TAG" \
+            --notes "Ouvre ce lien depuis ton téléphone Android et touche TelEnForme.apk pour l'installer."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TelEnForme-apk
+          path: TelEnForme.apk
