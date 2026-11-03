@@ -2,6 +2,12 @@ plugins {
     id 'com.android.application'
 }
 
+// Numéro de version donné par GitHub à chaque fabrication (1.0.3, 1.0.4…)
+def vCode = Integer.parseInt((project.findProperty('appVersionCode') ?: '1').toString())
+def vName = (project.findProperty('appVersionName') ?: '1.0').toString()
+// Clé de signature fixe, créée et gardée par GitHub (jamais publiée dans le dépôt)
+def ciKey = rootProject.file('signing.keystore')
+
 android {
     namespace 'com.savy.telenforme'
     compileSdk 34
@@ -10,11 +16,25 @@ android {
         applicationId 'com.savy.telenforme'
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode vCode
+        versionName vName
+    }
+
+    signingConfigs {
+        ci {
+            if (ciKey.exists()) {
+                storeFile ciKey
+                storePassword 'telenforme-ci'
+                keyAlias 'telenforme'
+                keyPassword 'telenforme-ci'
+            }
+        }
     }
 
     buildTypes {
+        debug {
+            if (ciKey.exists()) signingConfig signingConfigs.ci
+        }
         release {
             minifyEnabled false
         }
