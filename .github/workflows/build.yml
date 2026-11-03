@@ -3,6 +3,8 @@ name: Construire l'APK
 on:
   push:
   workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'   # chaque lundi : garde la clé de signature en mémoire
 
 permissions:
   contents: write
@@ -18,17 +20,38 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Récupérer la clé de signature
+        id: key
+        uses: actions/cache@v4
+        with:
+          path: signing.keystore
+          key: telenforme-signing-key-v1
+
+      - name: Créer la clé de signature (une seule fois)
+        if: steps.key.outputs.cache-hit != 'true'
+        run: >
+          keytool -genkeypair -keystore signing.keystore
+          -storepass telenforme-ci -keypass telenforme-ci -alias telenforme
+          -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Tel en forme"
+
       - uses: gradle/actions/setup-gradle@v4
+        if: github.event_name != 'schedule'
         with:
           gradle-version: '8.11.1'
 
       - name: Compiler
-        run: gradle --no-daemon assembleDebug
+        if: github.event_name != 'schedule'
+        run: >
+          gradle --no-daemon assembleDebug
+          -PappVersionCode=${{ github.run_number }}
+          -PappVersionName=1.0.${{ github.run_number }}
 
       - name: Renommer l'APK
+        if: github.event_name != 'schedule'
         run: cp app/build/outputs/apk/debug/app-debug.apk TelEnForme.apk
 
       - name: Publier en téléchargement direct (onglet Releases)
+        if: github.event_name != 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -36,8 +59,3 @@ jobs:
           gh release create "$TAG" TelEnForme.apk \
             --title "Tél en forme $TAG" \
             --notes "Ouvre ce lien depuis ton téléphone Android et touche TelEnForme.apk pour l'installer."
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: TelEnForme-apk
-          path: TelEnForme.apk
