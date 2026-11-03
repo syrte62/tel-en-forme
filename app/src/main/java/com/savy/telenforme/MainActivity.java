@@ -4,8 +4,11 @@ import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AlertDialog;
 import android.app.AppOpsManager;
+import android.app.usage.NetworkStats;
+import android.app.usage.NetworkStatsManager;
 import android.app.usage.StorageStats;
 import android.app.usage.StorageStatsManager;
+import android.app.usage.UsageEvents;
 import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
 import android.content.ActivityNotFoundException;
@@ -14,11 +17,13 @@ import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.net.ConnectivityManager;
 import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -26,16 +31,19 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.Process;
 import android.os.StatFs;
 import android.os.storage.StorageManager;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.text.format.Formatter;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -48,6 +56,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -55,34 +64,53 @@ import java.util.concurrent.Executors;
 
 /**
  * Tél en forme : un petit coach d'entretien pour Android.
- * - Note de santé du téléphone (stockage, mémoire, batterie, applis inutilisées)
- * - Liste des applis installées, avec leur poids et leur dernière utilisation
- * - Désinstallation propre (par la fenêtre officielle d'Android), une ou plusieurs à la fois
- * - Raccourcis vers les réglages d'entretien
+ * - Note de santé du téléphone (stockage, mémoire, batterie, applis)
+ * - Applis inutiles : jamais ou presque jamais ouvertes
+ * - Applis gourmandes : celles qui tournent en fond, consomment des données en cachette,
+ *   suivent la position en permanence ou échappent à l'économie de batterie
+ *   (les causes habituelles de chauffe et de ralentissement)
+ * - Quand le téléphone est chaud : quelles applis ont tourné ces 2 dernières heures
+ * - Désinstallation propre via la fenêtre officielle d'Android
  */
 public class MainActivity extends Activity {
 
-    private static final long DAY = 24L * 60 * 60 * 1000;
+    private static final long MIN = 60L * 1000;
+    private static final long HOUR = 60 * MIN;
+    private static final long DAY = 24 * HOUR;
     private static final int UNUSED_DAYS = 30;
+    private static final long RARE_USE_MS = 5 * MIN;      // moins de 5 min en 30 jours = presque jamais utilisée
+    private static final int IMPACT_THRESHOLD = 15;       // à partir de là, l'appli est « gourmande »
+    private static final float HOT_TEMP = 37f;
+    private static final long RECENT_WINDOW = 2 * HOUR;
     private static final int REQ_UNINSTALL = 42;
 
     private static final int FILTER_UNUSED = 0;
-    private static final int FILTER_HEAVY = 1;
-    private static final int FILTER_ALL = 2;
+    private static final int FILTER_IMPACT = 1;
+    private static final int FILTER_HEAVY = 2;
+    private static final int FILTER_ALL = 3;
 
     static class AppItem {
         String pkg;
         String label;
         Drawable icon;
+        int uid;
         long size = -1;
-        long cache = -1;
         long lastUsed = 0;
         long installed = 0;
+        long fg7 = 0;        // temps à l'écran sur 7 jours
+        long fgs7 = 0;       // temps en service d'arrière-plan sur 7 jours
+        long fg30 = 0;       // temps à l'écran sur 30 jours
+        long bgData7 = 0;    // données consommées en arrière-plan sur 7 jours
+        long recentFg = 0;   // à l'écran ces 2 dernières heures
+        long recentFgs = 0;  // en fond ces 2 dernières heures
+        boolean boot, bgLoc, noOptim;
+        int impact = 0;
+        final List<String> heatReasons = new ArrayList<>();
+        String unusedReason;
     }
 
     // Couleurs
-    private int cBg, cCard, cText, cSub, cAccent, cLine;
-    private final int cWarn = Color.parseColor("#E0A100");
+    private int cBg, cCard, cText, cSub, cAccent, cLine, cWarn;
     private final int cDanger = Color.parseColor("#E5484D");
 
     private float dp;
@@ -90,10 +118,11 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     private TextView scoreView, scoreLabel, storageVal, storageSub, ramVal, ramSub, batVal, batSub;
-    private TextView appsSummary;
-    private LinearLayout tipsBox, appList, permCard, chipsRow;
+    private TextView appsSummary, filterHint;
+    private LinearLayout tipsBox, appList, permCard, hotCard, hotList;
+    private TextView hotTitle;
     private Button uninstallBtn;
-    private final TextView[] chips = new TextView[3];
+    private final TextView[] chips = new TextView[4];
 
     private List<AppItem> apps = new ArrayList<>();
     private final Set<String> selected = new HashSet<>();
@@ -105,11 +134,11 @@ public class MainActivity extends Activity {
     private boolean uninstalling = false;
     private int removedCount = 0;
 
-    // Mesures pour la note
     private int storageUsedPct = 0;
     private int ramFreePct = 100;
     private int batHealth = BatteryManager.BATTERY_HEALTH_GOOD;
     private float batTemp = 0;
+    private boolean charging = false;
 
     // ------------------------------------------------------------------ cycle de vie
 
@@ -155,6 +184,7 @@ public class MainActivity extends Activity {
             cSub = Color.parseColor("#A0A6AE");
             cAccent = Color.parseColor("#4CC38A");
             cLine = Color.parseColor("#2C3036");
+            cWarn = Color.parseColor("#F2C25B");
         } else {
             cBg = Color.parseColor("#F4F6F8");
             cCard = Color.WHITE;
@@ -162,6 +192,7 @@ public class MainActivity extends Activity {
             cSub = Color.parseColor("#5F6670");
             cAccent = Color.parseColor("#1F9D63");
             cLine = Color.parseColor("#E3E6EA");
+            cWarn = Color.parseColor("#A86B00");
         }
         getWindow().setStatusBarColor(cBg);
         getWindow().setNavigationBarColor(cBg);
@@ -273,7 +304,6 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         statsLp.bottomMargin = px(12);
         stats.setLayoutParams(statsLp);
-
         TextView[] s1 = statCard(stats, "Stockage", true);
         storageVal = s1[0];
         storageSub = s1[1];
@@ -285,10 +315,23 @@ public class MainActivity extends Activity {
         batSub = s3[1];
         root.addView(stats);
 
+        // --- Carte « ça chauffe »
+        hotCard = card();
+        hotTitle = text("Ton téléphone est chaud", 16, cDanger, true);
+        hotCard.addView(hotTitle);
+        TextView hotSub = text("Applis qui ont tourné ces 2 dernières heures :", 14, cSub, false);
+        hotSub.setPadding(0, px(4), 0, px(4));
+        hotCard.addView(hotSub);
+        hotList = new LinearLayout(this);
+        hotList.setOrientation(LinearLayout.VERTICAL);
+        hotCard.addView(hotList);
+        hotCard.setVisibility(View.GONE);
+        root.addView(hotCard);
+
         // --- Carte autorisation
         permCard = card();
         permCard.addView(text("Une autorisation à donner", 16, cText, true));
-        TextView pt = text("Pour savoir quelles applis tu n'utilises plus et combien elles pèsent, "
+        TextView pt = text("Pour repérer les applis inutiles et celles qui chauffent ou ralentissent ton téléphone, "
                 + "active « Tél en forme » dans la liste qui va s'ouvrir, puis reviens ici.", 14, cSub, false);
         pt.setPadding(0, px(6), 0, 0);
         permCard.addView(pt);
@@ -304,11 +347,13 @@ public class MainActivity extends Activity {
         appsSummary = text("Analyse des applis…", 14, cSub, false);
         appsCard.addView(appsSummary);
 
-        chipsRow = new LinearLayout(this);
+        HorizontalScrollView chipsScroll = new HorizontalScrollView(this);
+        chipsScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout chipsRow = new LinearLayout(this);
         chipsRow.setOrientation(LinearLayout.HORIZONTAL);
         chipsRow.setPadding(0, px(12), 0, px(4));
-        String[] names = {"Inutilisées", "Les plus lourdes", "Toutes"};
-        for (int i = 0; i < 3; i++) {
+        String[] names = {"Inutiles", "Gourmandes", "Lourdes", "Toutes"};
+        for (int i = 0; i < chips.length; i++) {
             final int f = i;
             TextView c = text(names[i], 14, cText, true);
             c.setPadding(px(14), px(8), px(14), px(8));
@@ -324,12 +369,12 @@ public class MainActivity extends Activity {
             chips[i] = c;
             chipsRow.addView(c);
         }
-        appsCard.addView(chipsRow);
+        chipsScroll.addView(chipsRow);
+        appsCard.addView(chipsScroll);
 
-        TextView hint = text("Coche les applis à supprimer. « Infos » ouvre la fiche de l'appli "
-                + "(pour vider son cache ou la désactiver).", 12, cSub, false);
-        hint.setPadding(0, px(6), 0, 0);
-        appsCard.addView(hint);
+        filterHint = text("", 13, cSub, false);
+        filterHint.setPadding(0, px(6), 0, 0);
+        appsCard.addView(filterHint);
 
         uninstallBtn = button("Désinstaller la sélection", true);
         uninstallBtn.setOnClickListener(v -> confirmUninstall());
@@ -346,7 +391,7 @@ public class MainActivity extends Activity {
         LinearLayout maint = card();
         addAction(maint, "Stockage", "Voir ce qui prend de la place (photos, fichiers, cache)",
                 new Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS));
-        addAction(maint, "Batterie", "Repérer les applis qui vident la batterie",
+        addAction(maint, "Batterie", "Voir quelles applis consomment le plus selon Android",
                 new Intent(Intent.ACTION_POWER_USAGE_SUMMARY));
         Intent store = getPackageManager().getLaunchIntentForPackage("com.android.vending");
         addAction(maint, "Mettre à jour les applis", "Ouvre le Play Store → profil → Gérer les applis",
@@ -363,10 +408,10 @@ public class MainActivity extends Activity {
         String[] advice = {
                 "Redémarre ton téléphone une fois par semaine : ça libère la mémoire proprement.",
                 "Garde au moins 15 % de stockage libre, sinon tout ralentit.",
-                "Sauvegarde tes photos (Google Photos, ordinateur) puis supprime-les du téléphone.",
+                "Pour une appli gourmande que tu veux garder : Infos → Batterie → « Restreinte ».",
+                "Évite de jouer ou de filmer pendant la charge : c'est ce qui chauffe le plus.",
                 "Évite les applis « booster » ou « nettoyeur » : elles tournent en fond et ralentissent plus qu'elles n'aident.",
-                "Installe les mises à jour d'Android et des applis : elles corrigent des failles de sécurité.",
-                "Ne force pas la fermeture des applis en permanence : Android gère bien la mémoire tout seul."
+                "Installe les mises à jour d'Android et des applis : elles corrigent des bugs et des failles."
         };
         for (String a : advice) {
             TextView t = text("•  " + a, 14, cText, false);
@@ -431,17 +476,38 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void openAppInfo(String pkg) {
+        openSettings(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg)));
+    }
+
     private void styleChips() {
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < chips.length; i++) {
             boolean on = i == filter;
             GradientDrawable g = rounded(on ? cAccent : Color.TRANSPARENT, 50);
             if (!on) g.setStroke(px(1), cLine);
             chips[i].setBackground(g);
             chips[i].setTextColor(on ? Color.WHITE : cText);
+            chips[i].setVisibility(usageGranted || i == FILTER_ALL ? View.VISIBLE : View.GONE);
         }
-        boolean showUnused = usageGranted;
-        chips[FILTER_UNUSED].setVisibility(showUnused ? View.VISIBLE : View.GONE);
-        chips[FILTER_HEAVY].setVisibility(showUnused ? View.VISIBLE : View.GONE);
+        String hint;
+        switch (filter) {
+            case FILTER_UNUSED:
+                hint = "Applis jamais ou presque jamais ouvertes depuis " + UNUSED_DAYS
+                        + " jours. Coche celles à supprimer.";
+                break;
+            case FILTER_IMPACT:
+                hint = "Applis qui tournent en fond, consomment des données en cachette ou suivent ta position : "
+                        + "elles font chauffer et ralentissent. Supprime-les, ou garde-les et touche « Infos » "
+                        + "→ Batterie → « Restreinte ».";
+                break;
+            case FILTER_HEAVY:
+                hint = "Les applis qui prennent le plus de place.";
+                break;
+            default:
+                hint = "Toutes les applis que tu as installées. « Infos » ouvre la fiche de l'appli "
+                        + "(vider le cache, forcer l'arrêt, batterie).";
+        }
+        filterHint.setText(hint);
     }
 
     // ------------------------------------------------------------------ analyse
@@ -468,6 +534,7 @@ public class MainActivity extends Activity {
                 for (AppItem a : apps) present.add(a.pkg);
                 selected.retainAll(present);
                 renderApps();
+                renderHot();
                 updateScore();
             });
         });
@@ -492,24 +559,130 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static void add(Map<String, Long> m, String k, long v) {
+        if (v <= 0) return;
+        Long old = m.get(k);
+        m.put(k, (old == null ? 0 : old) + v);
+    }
+
+    private static long get(Map<String, Long> m, String k) {
+        Long v = m.get(k);
+        return v == null ? 0 : v;
+    }
+
+    private Map<String, UsageStats> aggregate(UsageStatsManager usm, long from, long to) {
+        try {
+            Map<String, UsageStats> m = usm.queryAndAggregateUsageStats(from, to);
+            if (m != null) return m;
+        } catch (Exception ignored) {
+        }
+        return Collections.emptyMap();
+    }
+
+    /** Données consommées en arrière-plan (Wi-Fi + mobile), par uid. */
+    @SuppressWarnings("deprecation")
+    private Map<Integer, Long> backgroundData(long from, long to) {
+        Map<Integer, Long> out = new HashMap<>();
+        NetworkStatsManager nsm;
+        try {
+            nsm = getSystemService(NetworkStatsManager.class);
+        } catch (Exception e) {
+            return out;
+        }
+        if (nsm == null) return out;
+        int[] types = {ConnectivityManager.TYPE_WIFI, ConnectivityManager.TYPE_MOBILE};
+        for (int type : types) {
+            NetworkStats ns = null;
+            try {
+                ns = nsm.querySummary(type, null, from, to);
+                NetworkStats.Bucket b = new NetworkStats.Bucket();
+                while (ns.hasNextBucket()) {
+                    ns.getNextBucket(b);
+                    if (b.getState() == NetworkStats.Bucket.STATE_DEFAULT) { // STATE_DEFAULT = arrière-plan
+                        long bytes = b.getRxBytes() + b.getTxBytes();
+                        Long old = out.get(b.getUid());
+                        out.put(b.getUid(), (old == null ? 0 : old) + bytes);
+                    }
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (ns != null) ns.close();
+            }
+        }
+        return out;
+    }
+
+    /** Temps à l'écran et en service de fond sur les dernières heures, à partir des événements d'Android. */
+    private void recentActivity(UsageStatsManager usm, long from, long to,
+                                Map<String, Long> fgOut, Map<String, Long> fgsOut) {
+        try {
+            UsageEvents ev = usm.queryEvents(from, to);
+            UsageEvents.Event e = new UsageEvents.Event();
+            Map<String, Long> fgStart = new HashMap<>();
+            Map<String, Long> fgsStart = new HashMap<>();
+            while (ev.hasNextEvent()) {
+                ev.getNextEvent(e);
+                String p = e.getPackageName();
+                long ts = e.getTimeStamp();
+                switch (e.getEventType()) {
+                    case 1: // passée au premier plan
+                        if (!fgStart.containsKey(p)) fgStart.put(p, ts);
+                        break;
+                    case 2: { // passée en arrière-plan
+                        Long s = fgStart.remove(p);
+                        if (s != null) add(fgOut, p, ts - s);
+                        break;
+                    }
+                    case 19: // service de fond démarré (Android 10+)
+                        if (!fgsStart.containsKey(p)) fgsStart.put(p, ts);
+                        break;
+                    case 20: { // service de fond arrêté
+                        Long s = fgsStart.remove(p);
+                        if (s != null) add(fgsOut, p, ts - s);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            }
+            for (Map.Entry<String, Long> en : fgStart.entrySet()) add(fgOut, en.getKey(), to - en.getValue());
+            for (Map.Entry<String, Long> en : fgsStart.entrySet()) add(fgsOut, en.getKey(), to - en.getValue());
+        } catch (Exception ignored) {
+        }
+    }
+
     private List<AppItem> loadApps(boolean granted) {
         PackageManager pm = getPackageManager();
         List<AppItem> out = new ArrayList<>();
         long now = System.currentTimeMillis();
 
-        Map<String, UsageStats> usage = new HashMap<>();
+        Map<String, UsageStats> usageAll = Collections.emptyMap();
+        Map<String, UsageStats> usage7 = Collections.emptyMap();
+        Map<String, UsageStats> usage30 = Collections.emptyMap();
+        Map<Integer, Long> bgData = Collections.emptyMap();
+        Map<String, Long> recentFg = new HashMap<>();
+        Map<String, Long> recentFgs = new HashMap<>();
         StorageStatsManager ssm = null;
+        PowerManager power = null;
+
         if (granted) {
             try {
                 UsageStatsManager usm = getSystemService(UsageStatsManager.class);
-                Map<String, UsageStats> m = usm.queryAndAggregateUsageStats(now - 400 * DAY, now);
-                if (m != null) usage = m;
+                usageAll = aggregate(usm, now - 400 * DAY, now);
+                usage7 = aggregate(usm, now - 7 * DAY, now);
+                usage30 = aggregate(usm, now - 30 * DAY, now);
+                recentActivity(usm, now - RECENT_WINDOW, now, recentFg, recentFgs);
             } catch (Exception ignored) {
             }
+            bgData = backgroundData(now - 7 * DAY, now);
             try {
                 ssm = getSystemService(StorageStatsManager.class);
             } catch (Exception ignored) {
             }
+        }
+        try {
+            power = getSystemService(PowerManager.class);
+        } catch (Exception ignored) {
         }
 
         List<ApplicationInfo> list;
@@ -525,6 +698,7 @@ public class MainActivity extends Activity {
 
             AppItem it = new AppItem();
             it.pkg = ai.packageName;
+            it.uid = ai.uid;
             try {
                 it.label = ai.loadLabel(pm).toString();
             } catch (Exception e) {
@@ -534,37 +708,132 @@ public class MainActivity extends Activity {
                 it.icon = ai.loadIcon(pm);
             } catch (Exception ignored) {
             }
+
             try {
-                PackageInfo pi = pm.getPackageInfo(ai.packageName, 0);
+                PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.GET_PERMISSIONS);
                 it.installed = pi.firstInstallTime;
+                if (pi.requestedPermissions != null) {
+                    for (int i = 0; i < pi.requestedPermissions.length; i++) {
+                        String perm = pi.requestedPermissions[i];
+                        boolean ok = pi.requestedPermissionsFlags != null
+                                && i < pi.requestedPermissionsFlags.length
+                                && (pi.requestedPermissionsFlags[i] & PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0;
+                        if ("android.permission.RECEIVE_BOOT_COMPLETED".equals(perm)) it.boot = true;
+                        if ("android.permission.ACCESS_BACKGROUND_LOCATION".equals(perm) && ok) it.bgLoc = true;
+                    }
+                }
             } catch (Exception ignored) {
             }
-            UsageStats us = usage.get(ai.packageName);
-            if (us != null && us.getLastTimeUsed() > 1262304000000L) { // après 2010 = valeur fiable
-                it.lastUsed = us.getLastTimeUsed();
+
+            if (power != null) {
+                try {
+                    it.noOptim = power.isIgnoringBatteryOptimizations(ai.packageName);
+                } catch (Exception ignored) {
+                }
             }
+
+            UsageStats us = usageAll.get(ai.packageName);
+            if (us != null && us.getLastTimeUsed() > 1262304000000L) it.lastUsed = us.getLastTimeUsed();
+            UsageStats u7 = usage7.get(ai.packageName);
+            if (u7 != null) {
+                it.fg7 = u7.getTotalTimeInForeground();
+                if (Build.VERSION.SDK_INT >= 29) it.fgs7 = u7.getTotalTimeForegroundServiceUsed();
+                if (u7.getLastTimeUsed() > it.lastUsed) it.lastUsed = u7.getLastTimeUsed();
+            }
+            UsageStats u30 = usage30.get(ai.packageName);
+            if (u30 != null) it.fg30 = u30.getTotalTimeInForeground();
+            Long bd = bgData.get(ai.uid);
+            if (bd != null) it.bgData7 = bd;
+            it.recentFg = get(recentFg, ai.packageName);
+            it.recentFgs = get(recentFgs, ai.packageName);
+
             if (ssm != null) {
                 try {
                     StorageStats st = ssm.queryStatsForPackage(StorageManager.UUID_DEFAULT, ai.packageName,
                             Process.myUserHandle());
                     it.size = st.getAppBytes() + st.getDataBytes();
-                    it.cache = st.getCacheBytes();
                 } catch (Exception ignored) {
                 }
+            }
+
+            if (granted) {
+                computeImpact(it);
+                it.unusedReason = unusedReason(it, now);
             }
             out.add(it);
         }
         return out;
     }
 
-    private boolean isUnused(AppItem a, long now) {
-        if (!usageGranted) return false;
-        if (a.installed > 0 && now - a.installed < UNUSED_DAYS * DAY) return false; // installée récemment
-        return a.lastUsed <= 0 || now - a.lastUsed > UNUSED_DAYS * DAY;
+    /** Note d'impact : ce qui fait chauffer, vide la batterie et ralentit le téléphone. */
+    private void computeImpact(AppItem a) {
+        int score = 0;
+        a.heatReasons.clear();
+
+        double fgsH = a.fgs7 / (double) HOUR;
+        if (fgsH >= 1) {
+            score += (int) Math.min(35, Math.round(fgsH * 3));
+            a.heatReasons.add("Tourne en arrière-plan : " + duration(a.fgs7) + " cette semaine");
+        }
+        long mb = a.bgData7 / (1024 * 1024);
+        if (mb >= 50) {
+            score += (int) Math.min(25, mb / 40 + 5);
+            a.heatReasons.add("Utilise internet en cachette : " + Formatter.formatShortFileSize(this, a.bgData7)
+                    + " cette semaine");
+        }
+        if (a.bgLoc) {
+            score += 12;
+            a.heatReasons.add("Peut suivre ta position en permanence");
+        }
+        if (a.noOptim) {
+            score += 10;
+            a.heatReasons.add("Échappe à l'économie de batterie d'Android");
+        }
+        double fgH = a.fg7 / (double) HOUR;
+        if (fgH >= 7) {
+            score += (int) Math.min(12, Math.round((fgH - 7) / 2) + 4);
+            a.heatReasons.add("Très utilisée : " + duration(a.fg7) + " à l'écran cette semaine");
+        }
+        if (score > 0 && a.boot) {
+            score += 3;
+            a.heatReasons.add("Se lance toute seule au démarrage");
+        }
+        a.impact = score;
+    }
+
+    private String unusedReason(AppItem a, long now) {
+        if (a.installed > 0 && now - a.installed < UNUSED_DAYS * DAY) return null; // installée récemment
+        if (a.lastUsed <= 0) return "Jamais ouverte d'après Android";
+        long days = (now - a.lastUsed) / DAY;
+        if (days > UNUSED_DAYS) {
+            return days >= 60 ? "Pas ouverte depuis " + (days / 30) + " mois"
+                    : "Pas ouverte depuis " + days + " jours";
+        }
+        if (a.fg30 < RARE_USE_MS) {
+            long m = Math.max(1, a.fg30 / MIN);
+            return "Presque jamais utilisée : " + (a.fg30 < MIN ? "moins d'1 min" : m + " min") + " en 30 jours";
+        }
+        return null;
+    }
+
+    private boolean isUnused(AppItem a) {
+        return usageGranted && a.unusedReason != null;
+    }
+
+    private boolean isGreedy(AppItem a) {
+        return usageGranted && a.impact >= IMPACT_THRESHOLD;
+    }
+
+    private static String duration(long ms) {
+        long m = ms / MIN;
+        if (m < 60) return Math.max(1, m) + " min";
+        long h = m / 60;
+        long rest = m % 60;
+        if (h >= 10 || rest == 0) return h + " h";
+        return String.format(Locale.FRANCE, "%d h %02d", h, rest);
     }
 
     private void updateDeviceStats() {
-        // Stockage
         try {
             StatFs sf = new StatFs(Environment.getDataDirectory().getPath());
             long total = sf.getTotalBytes();
@@ -577,7 +846,6 @@ public class MainActivity extends Activity {
             storageVal.setText("?");
         }
 
-        // Mémoire vive
         try {
             ActivityManager am = getSystemService(ActivityManager.class);
             ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
@@ -590,7 +858,6 @@ public class MainActivity extends Activity {
             ramVal.setText("?");
         }
 
-        // Batterie
         try {
             Intent b = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
             if (b != null) {
@@ -598,11 +865,12 @@ public class MainActivity extends Activity {
                 int scale = b.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
                 batHealth = b.getIntExtra(BatteryManager.EXTRA_HEALTH, BatteryManager.BATTERY_HEALTH_UNKNOWN);
                 batTemp = b.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) / 10f;
+                charging = b.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
                 int pct = scale > 0 ? Math.round(100f * level / scale) : level;
                 batVal.setText(pct + " %");
-                boolean badHealth = isBadBattery();
-                batVal.setTextColor(badHealth ? cDanger : cText);
+                batVal.setTextColor(isBadBattery() ? cDanger : cText);
                 batSub.setText(healthText(batHealth) + " · " + Math.round(batTemp) + " °C");
+                batSub.setTextColor(batTemp >= HOT_TEMP ? cDanger : cSub);
             }
         } catch (Exception e) {
             batVal.setText("?");
@@ -629,8 +897,64 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Carte « ton téléphone est chaud » : quelles applis ont tourné récemment. */
+    private void renderHot() {
+        hotList.removeAllViews();
+        if (!usageGranted || batTemp < HOT_TEMP) {
+            hotCard.setVisibility(View.GONE);
+            return;
+        }
+        List<AppItem> recent = new ArrayList<>();
+        for (AppItem a : apps) if (a.recentFg + a.recentFgs >= 2 * MIN) recent.add(a);
+        recent.sort((x, y) -> Long.compare(y.recentFg + y.recentFgs, x.recentFg + x.recentFgs));
+
+        hotTitle.setText("Ton téléphone est chaud (" + Math.round(batTemp) + " °C)"
+                + (charging ? " et en charge" : ""));
+        if (recent.isEmpty()) {
+            TextView t = text(charging
+                    ? "Aucune de tes applis n'a beaucoup tourné : c'est sans doute la charge. Laisse-le à l'air libre, sans coque."
+                    : "Aucune de tes applis n'a beaucoup tourné : vérifie la luminosité, le soleil, ou une appli système dans Réglages → Batterie.",
+                    14, cText, false);
+            hotList.addView(t);
+        } else {
+            int n = 0;
+            for (AppItem a : recent) {
+                if (n++ >= 5) break;
+                StringBuilder d = new StringBuilder();
+                if (a.recentFg >= MIN) d.append(duration(a.recentFg)).append(" à l'écran");
+                if (a.recentFgs >= MIN) {
+                    if (d.length() > 0) d.append(" · ");
+                    d.append(duration(a.recentFgs)).append(" en arrière-plan");
+                }
+                LinearLayout row = new LinearLayout(this);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(0, px(6), 0, px(6));
+                ImageView icon = new ImageView(this);
+                if (a.icon != null) icon.setImageDrawable(a.icon);
+                LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(px(32), px(32));
+                ilp.rightMargin = px(10);
+                icon.setLayoutParams(ilp);
+                row.addView(icon);
+                LinearLayout texts = new LinearLayout(this);
+                texts.setOrientation(LinearLayout.VERTICAL);
+                texts.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                texts.addView(text(a.label, 15, cText, true));
+                texts.addView(text(d.toString(), 12, cSub, false));
+                row.addView(texts);
+                TextView info = text("Infos", 13, cAccent, true);
+                info.setPadding(px(10), px(8), px(4), px(8));
+                info.setOnClickListener(v -> openAppInfo(a.pkg));
+                row.addView(info);
+                hotList.addView(row);
+            }
+            TextView adv = text("Si l'une d'elles ne te sert pas en ce moment : Infos → « Forcer l'arrêt ».", 13, cSub, false);
+            adv.setPadding(0, px(6), 0, 0);
+            hotList.addView(adv);
+        }
+        hotCard.setVisibility(View.VISIBLE);
+    }
+
     private void updateScore() {
-        long now = System.currentTimeMillis();
         int score = 100;
         List<String> tips = new ArrayList<>();
 
@@ -656,20 +980,26 @@ public class MainActivity extends Activity {
         }
 
         if (appsLoaded && usageGranted) {
-            int unused = 0;
+            int unused = 0, greedy = 0;
             long unusedSize = 0;
             for (AppItem a : apps) {
-                if (isUnused(a, now)) {
+                if (isUnused(a)) {
                     unused++;
                     if (a.size > 0) unusedSize += a.size;
                 }
+                if (isGreedy(a)) greedy++;
             }
             score -= Math.min(20, unused * 2);
+            score -= Math.min(15, greedy * 3);
+            if (greedy > 0) {
+                tips.add(greedy + " appli" + (greedy > 1 ? "s gourmandes" : " gourmande")
+                        + " (tourne" + (greedy > 1 ? "nt" : "") + " en fond, chauffe" + (greedy > 1 ? "nt" : "")
+                        + ") : voir l'onglet « Gourmandes ».");
+            }
             if (unused > 0) {
-                tips.add(unused + " appli" + (unused > 1 ? "s" : "") + " non utilisée"
-                        + (unused > 1 ? "s" : "") + " depuis plus de " + UNUSED_DAYS + " jours"
+                tips.add(unused + " appli" + (unused > 1 ? "s inutiles" : " inutile")
                         + (unusedSize > 0 ? " (" + Formatter.formatShortFileSize(this, unusedSize) + " à récupérer)" : "")
-                        + ".");
+                        + " : voir l'onglet « Inutiles ».");
             }
         } else if (!usageGranted) {
             tips.add("Donne l'autorisation ci-dessous pour une analyse complète des applis.");
@@ -698,19 +1028,20 @@ public class MainActivity extends Activity {
         final long now = System.currentTimeMillis();
 
         List<AppItem> shown = new ArrayList<>();
-        int unusedCount = 0;
-        long unusedSize = 0;
+        int unusedCount = 0, greedyCount = 0;
         for (AppItem a : apps) {
-            boolean un = isUnused(a, now);
-            if (un) {
-                unusedCount++;
-                if (a.size > 0) unusedSize += a.size;
-            }
+            boolean un = isUnused(a);
+            boolean gr = isGreedy(a);
+            if (un) unusedCount++;
+            if (gr) greedyCount++;
             if (filter == FILTER_UNUSED && !un) continue;
+            if (filter == FILTER_IMPACT && !gr) continue;
             shown.add(a);
         }
 
-        if (filter == FILTER_HEAVY) {
+        if (filter == FILTER_IMPACT) {
+            shown.sort((x, y) -> Integer.compare(y.impact, x.impact));
+        } else if (filter == FILTER_HEAVY) {
             shown.sort((x, y) -> Long.compare(y.size, x.size));
             if (shown.size() > 25) shown = new ArrayList<>(shown.subList(0, 25));
         } else if (filter == FILTER_UNUSED) {
@@ -721,26 +1052,26 @@ public class MainActivity extends Activity {
 
         String summary = apps.size() + " applis installées par toi";
         if (usageGranted) {
-            summary += " · " + unusedCount + " inutilisée" + (unusedCount > 1 ? "s" : "");
-            if (unusedSize > 0) summary += " (" + Formatter.formatShortFileSize(this, unusedSize) + ")";
+            summary += " · " + unusedCount + " inutile" + (unusedCount > 1 ? "s" : "")
+                    + " · " + greedyCount + " gourmande" + (greedyCount > 1 ? "s" : "");
         }
         appsSummary.setText(summary);
 
         if (shown.isEmpty()) {
-            TextView empty = text(filter == FILTER_UNUSED
-                    ? "Aucune appli oubliée. Bravo, ton téléphone est bien rangé !"
-                    : "Aucune appli à afficher.", 14, cSub, false);
+            String msg;
+            if (filter == FILTER_UNUSED) msg = "Aucune appli oubliée. Bravo, ton téléphone est bien rangé !";
+            else if (filter == FILTER_IMPACT) msg = "Aucune appli ne tourne trop en arrière-plan. Parfait !";
+            else msg = "Aucune appli à afficher.";
+            TextView empty = text(msg, 14, cSub, false);
             empty.setPadding(0, px(12), 0, px(4));
             appList.addView(empty);
         }
 
-        for (AppItem a : shown) {
-            appList.addView(appRow(a, isUnused(a, now), now));
-        }
+        for (AppItem a : shown) appList.addView(appRow(a, now));
         updateUninstallButton();
     }
 
-    private View appRow(AppItem a, boolean unused, long now) {
+    private View appRow(AppItem a, long now) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -748,7 +1079,7 @@ public class MainActivity extends Activity {
 
         CheckBox cb = new CheckBox(this);
         cb.setChecked(selected.contains(a.pkg));
-        cb.setButtonTintList(android.content.res.ColorStateList.valueOf(cAccent));
+        cb.setButtonTintList(ColorStateList.valueOf(cAccent));
         cb.setOnCheckedChangeListener((b, checked) -> {
             if (checked) selected.add(a.pkg);
             else selected.remove(a.pkg);
@@ -769,7 +1100,7 @@ public class MainActivity extends Activity {
         texts.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         TextView name = text(a.label, 15, cText, true);
         name.setSingleLine(true);
-        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        name.setEllipsize(TextUtils.TruncateAt.END);
         texts.addView(name);
 
         StringBuilder d = new StringBuilder();
@@ -778,16 +1109,22 @@ public class MainActivity extends Activity {
             if (d.length() > 0) d.append(" · ");
             d.append(lastUsedText(a, now));
         }
-        if (d.length() > 0) {
-            TextView det = text(d.toString(), 12, unused ? cWarn : cSub, unused);
-            texts.addView(det);
+        if (d.length() > 0) texts.addView(text(d.toString(), 12, cSub, false));
+
+        // Raisons affichées selon l'onglet
+        List<String> reasons = new ArrayList<>();
+        if ((filter == FILTER_UNUSED || filter == FILTER_ALL) && isUnused(a)) reasons.add(a.unusedReason);
+        if ((filter == FILTER_IMPACT || filter == FILTER_ALL) && isGreedy(a)) reasons.addAll(a.heatReasons);
+        for (String r : reasons) {
+            TextView rt = text("•  " + r, 12, cWarn, true);
+            rt.setPadding(0, px(2), 0, 0);
+            texts.addView(rt);
         }
         row.addView(texts);
 
         TextView info = text("Infos", 13, cAccent, true);
         info.setPadding(px(10), px(8), px(4), px(8));
-        info.setOnClickListener(v -> openSettings(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                Uri.parse("package:" + a.pkg))));
+        info.setOnClickListener(v -> openAppInfo(a.pkg));
         row.addView(info);
 
         row.setOnClickListener(v -> cb.setChecked(!cb.isChecked()));
@@ -839,7 +1176,7 @@ public class MainActivity extends Activity {
                 .setTitle("Désinstaller " + i + " appli" + (i > 1 ? "s" : "") + " ?")
                 .setMessage(names.toString())
                 .setNegativeButton("Annuler", null)
-                .setPositiveButton("Continuer", (d, w) -> startUninstall())
+                .setPositiveButton("Continuer", (dlg, w) -> startUninstall())
                 .show();
     }
 
