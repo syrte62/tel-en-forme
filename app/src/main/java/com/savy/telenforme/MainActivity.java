@@ -83,6 +83,7 @@ public class MainActivity extends Activity {
     private static final float HOT_TEMP = 37f;
     private static final long RECENT_WINDOW = 2 * HOUR;
     private static final int REQ_UNINSTALL = 42;
+    private static final int PAGE = 15;
 
     private static final int FILTER_UNUSED = 0;
     private static final int FILTER_IMPACT = 1;
@@ -129,6 +130,7 @@ public class MainActivity extends Activity {
     private boolean usageGranted = false;
     private boolean appsLoaded = false;
     private int filter = -1;
+    private int shownLimit = PAGE;
 
     private final ArrayDeque<String> queue = new ArrayDeque<>();
     private boolean uninstalling = false;
@@ -272,6 +274,8 @@ public class MainActivity extends Activity {
         sv.addView(root);
 
         root.addView(text("Tél en forme", 28, cText, true));
+        TextView ver = text("Version " + appVersion(), 15, cAccent, true);
+        root.addView(ver);
         TextView device = text(Build.MANUFACTURER + " " + Build.MODEL + " · Android " + Build.VERSION.RELEASE,
                 14, cSub, false);
         device.setPadding(0, px(2), 0, px(16));
@@ -341,6 +345,22 @@ public class MainActivity extends Activity {
         permCard.setVisibility(View.GONE);
         root.addView(permCard);
 
+        // --- Entretien rapide
+        root.addView(sectionTitle("Entretien rapide"));
+        LinearLayout maint = card();
+        addAction(maint, "Stockage", "Voir ce qui prend de la place (photos, fichiers, cache)",
+                new Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS));
+        addAction(maint, "Batterie", "Voir quelles applis consomment le plus selon Android",
+                new Intent(Intent.ACTION_POWER_USAGE_SUMMARY));
+        Intent store = getPackageManager().getLaunchIntentForPackage("com.android.vending");
+        addAction(maint, "Mettre à jour les applis", "Ouvre le Play Store → profil → Gérer les applis",
+                store != null ? store : new Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=")));
+        addAction(maint, "Mise à jour d'Android", "Vérifier les mises à jour de sécurité",
+                new Intent("android.settings.SYSTEM_UPDATE_SETTINGS"));
+        addAction(maint, "Applis préinstallées", "Désactiver celles qu'on ne peut pas supprimer",
+                new Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS));
+        root.addView(maint);
+
         // --- Applications
         root.addView(sectionTitle("Applications"));
         LinearLayout appsCard = card();
@@ -363,6 +383,7 @@ public class MainActivity extends Activity {
             c.setLayoutParams(lp);
             c.setOnClickListener(v -> {
                 filter = f;
+                shownLimit = PAGE;
                 styleChips();
                 renderApps();
             });
@@ -386,22 +407,6 @@ public class MainActivity extends Activity {
         appsCard.addView(appList);
         root.addView(appsCard);
 
-        // --- Entretien rapide
-        root.addView(sectionTitle("Entretien rapide"));
-        LinearLayout maint = card();
-        addAction(maint, "Stockage", "Voir ce qui prend de la place (photos, fichiers, cache)",
-                new Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS));
-        addAction(maint, "Batterie", "Voir quelles applis consomment le plus selon Android",
-                new Intent(Intent.ACTION_POWER_USAGE_SUMMARY));
-        Intent store = getPackageManager().getLaunchIntentForPackage("com.android.vending");
-        addAction(maint, "Mettre à jour les applis", "Ouvre le Play Store → profil → Gérer les applis",
-                store != null ? store : new Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=")));
-        addAction(maint, "Mise à jour d'Android", "Vérifier les mises à jour de sécurité",
-                new Intent("android.settings.SYSTEM_UPDATE_SETTINGS"));
-        addAction(maint, "Applis préinstallées", "Désactiver celles qu'on ne peut pas supprimer",
-                new Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS));
-        root.addView(maint);
-
         // --- Bons réflexes
         root.addView(sectionTitle("Les bons réflexes"));
         LinearLayout tips = card();
@@ -421,6 +426,14 @@ public class MainActivity extends Activity {
         root.addView(tips);
 
         setContentView(sv);
+    }
+
+    private String appVersion() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "?";
+        }
     }
 
     private TextView[] statCard(LinearLayout parent, String title, boolean withGap) {
@@ -1067,7 +1080,17 @@ public class MainActivity extends Activity {
             appList.addView(empty);
         }
 
-        for (AppItem a : shown) appList.addView(appRow(a, now));
+        int limit = Math.min(shown.size(), shownLimit);
+        for (int k = 0; k < limit; k++) appList.addView(appRow(shown.get(k), now));
+        if (shown.size() > limit) {
+            int rest = shown.size() - limit;
+            Button more = button("Afficher " + Math.min(rest, PAGE) + " de plus (" + rest + " restantes)", false);
+            more.setOnClickListener(v -> {
+                shownLimit += PAGE;
+                renderApps();
+            });
+            appList.addView(more);
+        }
         updateUninstallButton();
     }
 
