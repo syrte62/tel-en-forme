@@ -8,18 +8,23 @@ import android.app.usage.NetworkStats;
 import android.app.usage.NetworkStatsManager;
 import android.app.usage.StorageStats;
 import android.app.usage.StorageStatsManager;
-import android.app.usage.UsageEvents;
 import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
 import android.content.ActivityNotFoundException;
+import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.DashPathEffect;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -36,17 +41,21 @@ import android.os.Process;
 import android.os.StatFs;
 import android.os.storage.StorageManager;
 import android.provider.Settings;
+import android.text.Editable;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.text.format.Formatter;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -65,11 +74,9 @@ import java.util.concurrent.Executors;
 /**
  * Tél en forme : un petit coach d'entretien pour Android.
  * - Note de santé du téléphone (stockage, mémoire, batterie, applis)
- * - Applis inutiles : jamais ou presque jamais ouvertes
- * - Applis gourmandes : celles qui tournent en fond, consomment des données en cachette,
- *   suivent la position en permanence ou échappent à l'économie de batterie
- *   (les causes habituelles de chauffe et de ralentissement)
- * - Quand le téléphone est chaud : quelles applis ont tourné ces 2 dernières heures
+ * - Applis inutiles, gourmandes, préinstallées, lourdes, cache, hors Play Store
+ * - Historique de chauffe sur 7 jours (relevé automatique toutes les 30 min)
+ * - Rappel d'entretien hebdomadaire
  * - Désinstallation propre via la fenêtre officielle d'Android
  */
 public class MainActivity extends Activity {
@@ -78,59 +85,84 @@ public class MainActivity extends Activity {
     private static final long HOUR = 60 * MIN;
     private static final long DAY = 24 * HOUR;
     private static final int UNUSED_DAYS = 30;
-    private static final long RARE_USE_MS = 5 * MIN;      // moins de 5 min en 30 jours = presque jamais utilisée
-    private static final int IMPACT_THRESHOLD = 15;       // à partir de là, l'appli est « gourmande »
+    private static final long RARE_USE_MS = 5 * MIN;
+    private static final int IMPACT_THRESHOLD = 15;
     private static final float HOT_TEMP = 37f;
     private static final long RECENT_WINDOW = 2 * HOUR;
+    private static final long CACHE_MIN = 20L * 1024 * 1024;
     private static final int REQ_UNINSTALL = 42;
+    private static final int REQ_NOTIF = 43;
     private static final int PAGE = 15;
 
     private static final int FILTER_UNUSED = 0;
     private static final int FILTER_IMPACT = 1;
-    private static final int FILTER_HEAVY = 2;
-    private static final int FILTER_ALL = 3;
+    private static final int FILTER_PREINST = 2;
+    private static final int FILTER_HEAVY = 3;
+    private static final int FILTER_CACHE = 4;
+    private static final int FILTER_SIDELOAD = 5;
+    private static final int FILTER_ALL = 6;
+
+    private static final Set<String> TRUSTED_STORES = new HashSet<>();
+
+    static {
+        TRUSTED_STORES.add("com.android.vending");
+        TRUSTED_STORES.add("com.xiaomi.mipicks");
+        TRUSTED_STORES.add("com.xiaomi.market");
+        TRUSTED_STORES.add("com.xiaomi.discover");
+        TRUSTED_STORES.add("com.amazon.venezia");
+        TRUSTED_STORES.add("com.sec.android.app.samsungapps");
+        TRUSTED_STORES.add("com.huawei.appmarket");
+        TRUSTED_STORES.add("com.heytap.market");
+        TRUSTED_STORES.add("com.oppo.market");
+        TRUSTED_STORES.add("com.google.android.feedback");
+    }
 
     static class AppItem {
         String pkg;
         String label;
         Drawable icon;
         int uid;
+        boolean system;      // préinstallée (non supprimable)
+        String known;        // description si c'est une appli préinstallée connue
         long size = -1;
+        long cache = -1;
         long lastUsed = 0;
         long installed = 0;
-        long fg7 = 0;        // temps à l'écran sur 7 jours
-        long fgs7 = 0;       // temps en service d'arrière-plan sur 7 jours
-        long fg30 = 0;       // temps à l'écran sur 30 jours
-        long bgData7 = 0;    // données consommées en arrière-plan sur 7 jours
-        long recentFg = 0;   // à l'écran ces 2 dernières heures
-        long recentFgs = 0;  // en fond ces 2 dernières heures
+        long fg7 = 0, fgs7 = 0, fg30 = 0, bgData7 = 0;
+        long recentFg = 0, recentFgs = 0;
         boolean boot, bgLoc, noOptim;
         int impact = 0;
         final List<String> heatReasons = new ArrayList<>();
         String unusedReason;
+        String sideloadFrom;  // non nul si installée hors d'une boutique officielle
     }
 
     // Couleurs
-    private int cBg, cCard, cText, cSub, cAccent, cLine, cWarn;
+    private int cBg, cCard, cText, cSub, cAccent, cLine, cWarn, cField;
     private final int cDanger = Color.parseColor("#E5484D");
 
     private float dp;
     private final ExecutorService exec = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
+    private SharedPreferences prefs;
 
     private TextView scoreView, scoreLabel, storageVal, storageSub, ramVal, ramSub, batVal, batSub;
-    private TextView appsSummary, filterHint;
-    private LinearLayout tipsBox, appList, permCard, hotCard, hotList;
-    private TextView hotTitle;
+    private TextView appsSummary, filterHint, hotTitle, histSummary;
+    private LinearLayout tipsBox, appList, permCard, hotCard, hotList, histApps;
+    private TempChart histChart;
     private Button uninstallBtn;
-    private final TextView[] chips = new TextView[4];
+    private Switch remindSwitch;
+    private final TextView[] chips = new TextView[7];
 
     private List<AppItem> apps = new ArrayList<>();
+    private List<HeatJob.Reading> history = new ArrayList<>();
     private final Set<String> selected = new HashSet<>();
+    private final Set<String> kept = new HashSet<>();
     private boolean usageGranted = false;
     private boolean appsLoaded = false;
     private int filter = -1;
     private int shownLimit = PAGE;
+    private String query = "";
 
     private final ArrayDeque<String> queue = new ArrayDeque<>();
     private boolean uninstalling = false;
@@ -148,13 +180,17 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         dp = getResources().getDisplayMetrics().density;
+        prefs = HeatJob.prefs(this);
+        kept.addAll(prefs.getStringSet("kept", Collections.emptySet()));
         setupColors();
         buildUi();
+        HeatJob.schedule(this);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        prefs.edit().putLong("lastOpen", System.currentTimeMillis()).apply();
         if (!uninstalling) refresh();
     }
 
@@ -174,6 +210,17 @@ public class MainActivity extends Activity {
         }
     }
 
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_NOTIF) {
+            boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            setRemind(ok);
+            if (!ok) Toast.makeText(this, "Sans les notifications, le rappel ne peut pas s'afficher.",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
     // ------------------------------------------------------------------ apparence
 
     private void setupColors() {
@@ -187,6 +234,7 @@ public class MainActivity extends Activity {
             cAccent = Color.parseColor("#4CC38A");
             cLine = Color.parseColor("#2C3036");
             cWarn = Color.parseColor("#F2C25B");
+            cField = Color.parseColor("#272B31");
         } else {
             cBg = Color.parseColor("#F4F6F8");
             cCard = Color.WHITE;
@@ -195,6 +243,7 @@ public class MainActivity extends Activity {
             cAccent = Color.parseColor("#1F9D63");
             cLine = Color.parseColor("#E3E6EA");
             cWarn = Color.parseColor("#A86B00");
+            cField = Color.parseColor("#EEF1F4");
         }
         getWindow().setStatusBarColor(cBg);
         getWindow().setNavigationBarColor(cBg);
@@ -274,8 +323,7 @@ public class MainActivity extends Activity {
         sv.addView(root);
 
         root.addView(text("Tél en forme", 28, cText, true));
-        TextView ver = text("Version " + appVersion(), 15, cAccent, true);
-        root.addView(ver);
+        root.addView(text("Version " + appVersion(), 15, cAccent, true));
         TextView device = text(Build.MANUFACTURER + " " + Build.MODEL + " · Android " + Build.VERSION.RELEASE,
                 14, cSub, false);
         device.setPadding(0, px(2), 0, px(16));
@@ -342,8 +390,46 @@ public class MainActivity extends Activity {
         Button permBtn = button("Autoriser l'accès", true);
         permBtn.setOnClickListener(v -> openSettings(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
         permCard.addView(permBtn);
+        TextView restricted = text("Interrupteur grisé ou message « Paramètre restreint » ? Touche le bouton "
+                + "ci-dessous, puis ⋮ en haut à droite → « Infos sur l'application » → ⋮ → « Autoriser les "
+                + "paramètres restreints ». Reviens ensuite sur « Autoriser l'accès ».", 13, cSub, false);
+        restricted.setPadding(0, px(12), 0, 0);
+        permCard.addView(restricted);
+        Button ficheBtn = button("Ouvrir la fiche de Tél en forme", false);
+        ficheBtn.setOnClickListener(v -> openAppInfo(getPackageName()));
+        permCard.addView(ficheBtn);
         permCard.setVisibility(View.GONE);
         root.addView(permCard);
+
+        // --- Historique de chauffe
+        root.addView(sectionTitle("Historique de chauffe (7 jours)"));
+        LinearLayout histCard = card();
+        histSummary = text("Les relevés commencent : reviens dans quelques heures.", 14, cText, false);
+        histCard.addView(histSummary);
+        histChart = new TempChart(this, dp, cAccent, cLine, cDanger, cSub);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, px(130));
+        clp.topMargin = px(12);
+        histChart.setLayoutParams(clp);
+        histChart.setVisibility(View.GONE);
+        histCard.addView(histChart);
+        histApps = new LinearLayout(this);
+        histApps.setOrientation(LinearLayout.VERTICAL);
+        histApps.setPadding(0, px(8), 0, 0);
+        histCard.addView(histApps);
+        if (Build.MANUFACTURER.toLowerCase(Locale.ROOT).contains("xiaomi")
+                || Build.MANUFACTURER.toLowerCase(Locale.ROOT).contains("redmi")
+                || Build.MANUFACTURER.toLowerCase(Locale.ROOT).contains("poco")) {
+            TextView xi = text("Sur Xiaomi, pour que les relevés continuent appli fermée : fiche de l'appli → "
+                    + "« Démarrage automatique » activé et « Économiseur de batterie » → « Pas de restrictions ».",
+                    12, cSub, false);
+            xi.setPadding(0, px(10), 0, 0);
+            histCard.addView(xi);
+            Button xiBtn = button("Ouvrir la fiche de Tél en forme", false);
+            xiBtn.setOnClickListener(v -> openAppInfo(getPackageName()));
+            histCard.addView(xiBtn);
+        }
+        root.addView(histCard);
 
         // --- Entretien rapide
         root.addView(sectionTitle("Entretien rapide"));
@@ -357,8 +443,34 @@ public class MainActivity extends Activity {
                 store != null ? store : new Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=")));
         addAction(maint, "Mise à jour d'Android", "Vérifier les mises à jour de sécurité",
                 new Intent("android.settings.SYSTEM_UPDATE_SETTINGS"));
-        addAction(maint, "Applis préinstallées", "Désactiver celles qu'on ne peut pas supprimer",
-                new Intent(Settings.ACTION_MANAGE_APPLICATIONS_SETTINGS));
+
+        maint.addView(divider());
+        LinearLayout remindRow = new LinearLayout(this);
+        remindRow.setGravity(Gravity.CENTER_VERTICAL);
+        remindRow.setPadding(0, px(10), 0, px(4));
+        LinearLayout rt = new LinearLayout(this);
+        rt.setOrientation(LinearLayout.VERTICAL);
+        rt.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        rt.addView(text("Rappel d'entretien", 16, cText, true));
+        rt.addView(text("Une notification si tu n'as pas ouvert l'appli depuis une semaine", 13, cSub, false));
+        remindRow.addView(rt);
+        remindSwitch = new Switch(this);
+        remindSwitch.setChecked(prefs.getBoolean("remind", false));
+        remindSwitch.setThumbTintList(ColorStateList.valueOf(cAccent));
+        remindSwitch.setOnCheckedChangeListener((b, on) -> {
+            if (!on) {
+                setRemind(false);
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF);
+            } else {
+                setRemind(true);
+            }
+        });
+        remindRow.addView(remindSwitch);
+        maint.addView(remindRow);
         root.addView(maint);
 
         // --- Applications
@@ -367,12 +479,42 @@ public class MainActivity extends Activity {
         appsSummary = text("Analyse des applis…", 14, cSub, false);
         appsCard.addView(appsSummary);
 
+        EditText search = new EditText(this);
+        search.setHint("Rechercher une appli…");
+        search.setSingleLine(true);
+        search.setTextSize(15);
+        search.setTextColor(cText);
+        search.setHintTextColor(cSub);
+        search.setBackground(rounded(cField, 12));
+        search.setPadding(px(14), px(10), px(14), px(10));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.topMargin = px(12);
+        search.setLayoutParams(slp);
+        search.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                query = s.toString().trim().toLowerCase(Locale.ROOT);
+                shownLimit = PAGE;
+                if (appsLoaded) renderApps();
+            }
+        });
+        appsCard.addView(search);
+
         HorizontalScrollView chipsScroll = new HorizontalScrollView(this);
         chipsScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout chipsRow = new LinearLayout(this);
         chipsRow.setOrientation(LinearLayout.HORIZONTAL);
         chipsRow.setPadding(0, px(12), 0, px(4));
-        String[] names = {"Inutiles", "Gourmandes", "Lourdes", "Toutes"};
+        String[] names = {"Inutiles", "Gourmandes", "Préinstallées", "Lourdes", "Cache", "Hors Play Store", "Toutes"};
         for (int i = 0; i < chips.length; i++) {
             final int f = i;
             TextView c = text(names[i], 14, cText, true);
@@ -413,9 +555,10 @@ public class MainActivity extends Activity {
         String[] advice = {
                 "Redémarre ton téléphone une fois par semaine : ça libère la mémoire proprement.",
                 "Garde au moins 15 % de stockage libre, sinon tout ralentit.",
-                "Pour une appli gourmande que tu veux garder : Infos → Batterie → « Restreinte ».",
+                "Pour une appli gourmande que tu veux garder : Infos → fiche Android → Batterie → « Restreinte ».",
                 "Évite de jouer ou de filmer pendant la charge : c'est ce qui chauffe le plus.",
                 "Évite les applis « booster » ou « nettoyeur » : elles tournent en fond et ralentissent plus qu'elles n'aident.",
+                "N'installe des applis hors Play Store que si tu connais leur origine.",
                 "Installe les mises à jour d'Android et des applis : elles corrigent des bugs et des failles."
         };
         for (String a : advice) {
@@ -434,6 +577,12 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             return "?";
         }
+    }
+
+    private void setRemind(boolean on) {
+        prefs.edit().putBoolean("remind", on).apply();
+        if (remindSwitch.isChecked() != on) remindSwitch.setChecked(on);
+        if (on) Toast.makeText(this, "Rappel activé.", Toast.LENGTH_SHORT).show();
     }
 
     private TextView[] statCard(LinearLayout parent, String title, boolean withGap) {
@@ -500,7 +649,8 @@ public class MainActivity extends Activity {
             if (!on) g.setStroke(px(1), cLine);
             chips[i].setBackground(g);
             chips[i].setTextColor(on ? Color.WHITE : cText);
-            chips[i].setVisibility(usageGranted || i == FILTER_ALL ? View.VISIBLE : View.GONE);
+            boolean needsUsage = i == FILTER_UNUSED || i == FILTER_IMPACT || i == FILTER_HEAVY || i == FILTER_CACHE;
+            chips[i].setVisibility(usageGranted || !needsUsage ? View.VISIBLE : View.GONE);
         }
         String hint;
         switch (filter) {
@@ -510,15 +660,28 @@ public class MainActivity extends Activity {
                 break;
             case FILTER_IMPACT:
                 hint = "Applis qui tournent en fond, consomment des données en cachette ou suivent ta position : "
-                        + "elles font chauffer et ralentissent. Supprime-les, ou garde-les et touche « Infos » "
-                        + "→ Batterie → « Restreinte ».";
+                        + "elles font chauffer et ralentissent. Supprime-les, ou touche « Infos » pour les "
+                        + "restreindre ou les garder.";
+                break;
+            case FILTER_PREINST:
+                hint = "Applis installées par le fabricant. On ne peut pas les supprimer, mais souvent les "
+                        + "désactiver : touche « Désactiver » puis le bouton « Désactiver » de la fiche. "
+                        + "S'il est grisé, Android ne le permet pas pour cette appli.";
                 break;
             case FILTER_HEAVY:
                 hint = "Les applis qui prennent le plus de place.";
                 break;
+            case FILTER_CACHE:
+                hint = "Le cache se recrée tout seul : le vider libère de la place sans rien perdre. "
+                        + "Touche « Infos » → fiche Android → Stockage → « Vider le cache ».";
+                break;
+            case FILTER_SIDELOAD:
+                hint = "Applis installées en dehors d'une boutique officielle. Garde seulement celles dont "
+                        + "tu connais l'origine.";
+                break;
             default:
                 hint = "Toutes les applis que tu as installées. « Infos » ouvre la fiche de l'appli "
-                        + "(vider le cache, forcer l'arrêt, batterie).";
+                        + "ou permet de la garder.";
         }
         filterHint.setText(hint);
     }
@@ -528,7 +691,8 @@ public class MainActivity extends Activity {
     private void refresh() {
         usageGranted = hasUsageAccess();
         permCard.setVisibility(usageGranted ? View.GONE : View.VISIBLE);
-        if (filter == -1 || (!usageGranted && filter != FILTER_ALL)) {
+        if (filter == -1 || (!usageGranted && (filter == FILTER_UNUSED || filter == FILTER_IMPACT
+                || filter == FILTER_HEAVY || filter == FILTER_CACHE))) {
             filter = usageGranted ? FILTER_UNUSED : FILTER_ALL;
         }
         styleChips();
@@ -537,17 +701,22 @@ public class MainActivity extends Activity {
 
         if (!appsLoaded) appsSummary.setText("Analyse des applis…");
         final boolean granted = usageGranted;
+        final Context ctx = getApplicationContext();
         exec.submit(() -> {
+            HeatJob.record(ctx, true);
+            List<HeatJob.Reading> hist = HeatJob.history(ctx);
             List<AppItem> result = loadApps(granted);
             ui.post(() -> {
                 if (isFinishing() || isDestroyed()) return;
                 apps = result;
+                history = hist;
                 appsLoaded = true;
                 Set<String> present = new HashSet<>();
-                for (AppItem a : apps) present.add(a.pkg);
+                for (AppItem a : apps) if (!a.system) present.add(a.pkg);
                 selected.retainAll(present);
                 renderApps();
                 renderHot();
+                renderHistory();
                 updateScore();
             });
         });
@@ -562,20 +731,23 @@ public class MainActivity extends Activity {
             } else {
                 mode = aom.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), getPackageName());
             }
-            if (mode == AppOpsManager.MODE_DEFAULT) {
-                return checkCallingOrSelfPermission(android.Manifest.permission.PACKAGE_USAGE_STATS)
-                        == PackageManager.PERMISSION_GRANTED;
+            if (mode == AppOpsManager.MODE_ALLOWED) return true;
+            if (mode == AppOpsManager.MODE_DEFAULT
+                    && checkCallingOrSelfPermission(android.Manifest.permission.PACKAGE_USAGE_STATS)
+                    == PackageManager.PERMISSION_GRANTED) {
+                return true;
             }
-            return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (Exception ignored) {
+        }
+        // Dernier recours : certains fabricants répondent mal, on essaie de lire réellement les données
+        try {
+            UsageStatsManager usm = getSystemService(UsageStatsManager.class);
+            long now = System.currentTimeMillis();
+            List<UsageStats> l = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, now - DAY, now);
+            return l != null && !l.isEmpty();
         } catch (Exception e) {
             return false;
         }
-    }
-
-    private static void add(Map<String, Long> m, String k, long v) {
-        if (v <= 0) return;
-        Long old = m.get(k);
-        m.put(k, (old == null ? 0 : old) + v);
     }
 
     private static long get(Map<String, Long> m, String k) {
@@ -625,42 +797,31 @@ public class MainActivity extends Activity {
         return out;
     }
 
-    /** Temps à l'écran et en service de fond sur les dernières heures, à partir des événements d'Android. */
-    private void recentActivity(UsageStatsManager usm, long from, long to,
-                                Map<String, Long> fgOut, Map<String, Long> fgsOut) {
+    /** D'où vient l'appli : null si d'une boutique officielle, sinon le nom de la source. */
+    @SuppressWarnings("deprecation")
+    private String sideloadSource(PackageManager pm, String pkg) {
+        String installer = null;
+        String initiating = null;
         try {
-            UsageEvents ev = usm.queryEvents(from, to);
-            UsageEvents.Event e = new UsageEvents.Event();
-            Map<String, Long> fgStart = new HashMap<>();
-            Map<String, Long> fgsStart = new HashMap<>();
-            while (ev.hasNextEvent()) {
-                ev.getNextEvent(e);
-                String p = e.getPackageName();
-                long ts = e.getTimeStamp();
-                switch (e.getEventType()) {
-                    case 1: // passée au premier plan
-                        if (!fgStart.containsKey(p)) fgStart.put(p, ts);
-                        break;
-                    case 2: { // passée en arrière-plan
-                        Long s = fgStart.remove(p);
-                        if (s != null) add(fgOut, p, ts - s);
-                        break;
-                    }
-                    case 19: // service de fond démarré (Android 10+)
-                        if (!fgsStart.containsKey(p)) fgsStart.put(p, ts);
-                        break;
-                    case 20: { // service de fond arrêté
-                        Long s = fgsStart.remove(p);
-                        if (s != null) add(fgsOut, p, ts - s);
-                        break;
-                    }
-                    default:
-                        break;
-                }
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.content.pm.InstallSourceInfo info = pm.getInstallSourceInfo(pkg);
+                installer = info.getInstallingPackageName();
+                initiating = info.getInitiatingPackageName();
+            } else {
+                installer = pm.getInstallerPackageName(pkg);
             }
-            for (Map.Entry<String, Long> en : fgStart.entrySet()) add(fgOut, en.getKey(), to - en.getValue());
-            for (Map.Entry<String, Long> en : fgsStart.entrySet()) add(fgsOut, en.getKey(), to - en.getValue());
         } catch (Exception ignored) {
+        }
+        if (installer != null && TRUSTED_STORES.contains(installer)) return null;
+        if (initiating != null && TRUSTED_STORES.contains(initiating)) return null;
+        String src = initiating != null && !initiating.contains("packageinstaller") ? initiating : installer;
+        if (src == null || src.contains("packageinstaller")) {
+            return src == null ? "source inconnue" : "un fichier .apk";
+        }
+        try {
+            return pm.getApplicationLabel(pm.getApplicationInfo(src, 0)).toString();
+        } catch (Exception e) {
+            return src;
         }
     }
 
@@ -684,7 +845,7 @@ public class MainActivity extends Activity {
                 usageAll = aggregate(usm, now - 400 * DAY, now);
                 usage7 = aggregate(usm, now - 7 * DAY, now);
                 usage30 = aggregate(usm, now - 30 * DAY, now);
-                recentActivity(usm, now - RECENT_WINDOW, now, recentFg, recentFgs);
+                HeatJob.activity(usm, now - RECENT_WINDOW, now, recentFg, recentFgs);
             } catch (Exception ignored) {
             }
             bgData = backgroundData(now - 7 * DAY, now);
@@ -706,12 +867,23 @@ public class MainActivity extends Activity {
         }
 
         for (ApplicationInfo ai : list) {
-            if ((ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0) continue; // applis système : non supprimables
             if (ai.packageName.equals(getPackageName())) continue;
+            boolean system = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+            String known = null;
+            if (system) {
+                if (!ai.enabled) continue; // déjà désactivée
+                known = Bloat.KNOWN.get(ai.packageName);
+                if (known == null) {
+                    if (Bloat.isEssential(ai.packageName)) continue;
+                    if (pm.getLaunchIntentForPackage(ai.packageName) == null) continue; // service invisible
+                }
+            }
 
             AppItem it = new AppItem();
             it.pkg = ai.packageName;
             it.uid = ai.uid;
+            it.system = system;
+            it.known = known;
             try {
                 it.label = ai.loadLabel(pm).toString();
             } catch (Exception e) {
@@ -724,7 +896,7 @@ public class MainActivity extends Activity {
 
             try {
                 PackageInfo pi = pm.getPackageInfo(ai.packageName, PackageManager.GET_PERMISSIONS);
-                it.installed = pi.firstInstallTime;
+                it.installed = system ? 0 : pi.firstInstallTime;
                 if (pi.requestedPermissions != null) {
                     for (int i = 0; i < pi.requestedPermissions.length; i++) {
                         String perm = pi.requestedPermissions[i];
@@ -765,9 +937,12 @@ public class MainActivity extends Activity {
                     StorageStats st = ssm.queryStatsForPackage(StorageManager.UUID_DEFAULT, ai.packageName,
                             Process.myUserHandle());
                     it.size = st.getAppBytes() + st.getDataBytes();
+                    it.cache = st.getCacheBytes();
                 } catch (Exception ignored) {
                 }
             }
+
+            if (!system) it.sideloadFrom = sideloadSource(pm, ai.packageName);
 
             if (granted) {
                 computeImpact(it);
@@ -816,7 +991,7 @@ public class MainActivity extends Activity {
 
     private String unusedReason(AppItem a, long now) {
         if (a.installed > 0 && now - a.installed < UNUSED_DAYS * DAY) return null; // installée récemment
-        if (a.lastUsed <= 0) return "Jamais ouverte d'après Android";
+        if (a.lastUsed <= 0) return a.system ? "Jamais utilisée d'après Android" : "Jamais ouverte d'après Android";
         long days = (now - a.lastUsed) / DAY;
         if (days > UNUSED_DAYS) {
             return days >= 60 ? "Pas ouverte depuis " + (days / 30) + " mois"
@@ -829,12 +1004,24 @@ public class MainActivity extends Activity {
         return null;
     }
 
+    private boolean isKept(AppItem a) {
+        return kept.contains(a.pkg);
+    }
+
     private boolean isUnused(AppItem a) {
-        return usageGranted && a.unusedReason != null;
+        return usageGranted && !a.system && !isKept(a) && a.unusedReason != null;
     }
 
     private boolean isGreedy(AppItem a) {
-        return usageGranted && a.impact >= IMPACT_THRESHOLD;
+        return usageGranted && !isKept(a) && a.impact >= IMPACT_THRESHOLD && (!a.system || a.known != null);
+    }
+
+    private boolean isPreinstalledToShow(AppItem a) {
+        return a.system && !isKept(a);
+    }
+
+    private boolean isSideloaded(AppItem a) {
+        return !a.system && !isKept(a) && a.sideloadFrom != null;
     }
 
     private static String duration(long ms) {
@@ -910,6 +1097,21 @@ public class MainActivity extends Activity {
         }
     }
 
+    private String labelOf(String pkg) {
+        for (AppItem a : apps) if (a.pkg.equals(pkg)) return a.label;
+        try {
+            PackageManager pm = getPackageManager();
+            return pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+        } catch (Exception e) {
+            return pkg;
+        }
+    }
+
+    private AppItem itemOf(String pkg) {
+        for (AppItem a : apps) if (a.pkg.equals(pkg)) return a;
+        return null;
+    }
+
     /** Carte « ton téléphone est chaud » : quelles applis ont tourné récemment. */
     private void renderHot() {
         hotList.removeAllViews();
@@ -939,32 +1141,108 @@ public class MainActivity extends Activity {
                     if (d.length() > 0) d.append(" · ");
                     d.append(duration(a.recentFgs)).append(" en arrière-plan");
                 }
-                LinearLayout row = new LinearLayout(this);
-                row.setGravity(Gravity.CENTER_VERTICAL);
-                row.setPadding(0, px(6), 0, px(6));
-                ImageView icon = new ImageView(this);
-                if (a.icon != null) icon.setImageDrawable(a.icon);
-                LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(px(32), px(32));
-                ilp.rightMargin = px(10);
-                icon.setLayoutParams(ilp);
-                row.addView(icon);
-                LinearLayout texts = new LinearLayout(this);
-                texts.setOrientation(LinearLayout.VERTICAL);
-                texts.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-                texts.addView(text(a.label, 15, cText, true));
-                texts.addView(text(d.toString(), 12, cSub, false));
-                row.addView(texts);
-                TextView info = text("Infos", 13, cAccent, true);
-                info.setPadding(px(10), px(8), px(4), px(8));
-                info.setOnClickListener(v -> openAppInfo(a.pkg));
-                row.addView(info);
-                hotList.addView(row);
+                hotList.addView(miniRow(a.icon, a.label, d.toString(), a));
             }
-            TextView adv = text("Si l'une d'elles ne te sert pas en ce moment : Infos → « Forcer l'arrêt ».", 13, cSub, false);
+            TextView adv = text("Si l'une d'elles ne te sert pas en ce moment : Infos → fiche Android → « Forcer l'arrêt ».",
+                    13, cSub, false);
             adv.setPadding(0, px(6), 0, 0);
             hotList.addView(adv);
         }
         hotCard.setVisibility(View.VISIBLE);
+    }
+
+    private View miniRow(Drawable iconD, String title, String sub, AppItem a) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, px(6), 0, px(6));
+        ImageView icon = new ImageView(this);
+        if (iconD != null) icon.setImageDrawable(iconD);
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(px(32), px(32));
+        ilp.rightMargin = px(10);
+        icon.setLayoutParams(ilp);
+        row.addView(icon);
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView tt = text(title, 15, cText, true);
+        tt.setSingleLine(true);
+        tt.setEllipsize(TextUtils.TruncateAt.END);
+        texts.addView(tt);
+        texts.addView(text(sub, 12, cSub, false));
+        row.addView(texts);
+        if (a != null) {
+            TextView info = text("Infos", 13, cAccent, true);
+            info.setPadding(px(10), px(8), px(4), px(8));
+            info.setOnClickListener(v -> showOptions(a));
+            row.addView(info);
+        }
+        return row;
+    }
+
+    /** Historique de chauffe : courbe sur 7 jours et applis présentes quand ça chauffe. */
+    private void renderHistory() {
+        histApps.removeAllViews();
+        if (history.size() < 3) {
+            histChart.setVisibility(View.GONE);
+            histSummary.setText("Les relevés commencent (" + history.size() + " pour l'instant). "
+                    + "Tél en forme note la température toutes les 30 minutes : reviens dans quelques heures.");
+            return;
+        }
+        long[] times = new long[history.size()];
+        float[] temps = new float[history.size()];
+        int max = 0, hot = 0, hotCharging = 0;
+        Map<String, Integer> counts = new HashMap<>();
+        for (int i = 0; i < history.size(); i++) {
+            HeatJob.Reading r = history.get(i);
+            times[i] = r.time;
+            temps[i] = r.tenths / 10f;
+            max = Math.max(max, r.tenths);
+            if (r.tenths >= HeatJob.HOT_TENTHS) {
+                hot++;
+                if (r.charging) hotCharging++;
+                for (String p : r.apps) {
+                    Integer c = counts.get(p);
+                    counts.put(p, c == null ? 1 : c + 1);
+                }
+            }
+        }
+        histChart.setData(times, temps);
+        histChart.setVisibility(View.VISIBLE);
+
+        long spanH = Math.max(1, (times[times.length - 1] - times[0]) / HOUR);
+        String span = spanH >= 48 ? (spanH / 24) + " jours" : spanH + " h";
+        StringBuilder s = new StringBuilder();
+        s.append(history.size()).append(" relevés sur ").append(span)
+                .append(" · maximum ").append(String.format(Locale.FRANCE, "%.1f", max / 10f)).append(" °C\n");
+        if (hot == 0) {
+            s.append("Aucune surchauffe (38 °C ou plus) : ton téléphone reste à bonne température.");
+        } else {
+            s.append(hot).append(" moment").append(hot > 1 ? "s" : "").append(" chaud").append(hot > 1 ? "s" : "")
+                    .append(" (38 °C ou plus)");
+            if (hotCharging > 0) s.append(", dont ").append(hotCharging).append(" pendant la charge");
+            s.append(".");
+        }
+        histSummary.setText(s.toString());
+
+        if (hot > 0) {
+            List<Map.Entry<String, Integer>> list = new ArrayList<>(counts.entrySet());
+            list.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+            if (list.isEmpty()) {
+                TextView t = text(hotCharging == hot
+                        ? "Aucune appli active à ces moments : c'est la charge qui chauffe."
+                        : "Aucune de tes applis n'était très active à ces moments.", 13, cSub, false);
+                histApps.addView(t);
+            } else {
+                histApps.addView(text("Applis actives quand ça chauffe :", 14, cText, true));
+                int n = 0;
+                for (Map.Entry<String, Integer> en : list) {
+                    if (n++ >= 5) break;
+                    AppItem a = itemOf(en.getKey());
+                    histApps.addView(miniRow(a != null ? a.icon : null, labelOf(en.getKey()),
+                            "présente " + en.getValue() + " fois sur " + hot, a));
+                }
+            }
+        }
     }
 
     private void updateScore() {
@@ -993,26 +1271,41 @@ public class MainActivity extends Activity {
         }
 
         if (appsLoaded && usageGranted) {
-            int unused = 0, greedy = 0;
-            long unusedSize = 0;
+            int unused = 0, greedy = 0, bloat = 0, side = 0;
+            long unusedSize = 0, cacheTotal = 0;
             for (AppItem a : apps) {
                 if (isUnused(a)) {
                     unused++;
                     if (a.size > 0) unusedSize += a.size;
                 }
                 if (isGreedy(a)) greedy++;
+                if (a.system && a.known != null && !isKept(a)) bloat++;
+                if (isSideloaded(a)) side++;
+                if (!a.system && a.cache > 0) cacheTotal += a.cache;
             }
             score -= Math.min(20, unused * 2);
             score -= Math.min(15, greedy * 3);
+            score -= Math.min(10, bloat);
             if (greedy > 0) {
                 tips.add(greedy + " appli" + (greedy > 1 ? "s gourmandes" : " gourmande")
                         + " (tourne" + (greedy > 1 ? "nt" : "") + " en fond, chauffe" + (greedy > 1 ? "nt" : "")
-                        + ") : voir l'onglet « Gourmandes ».");
+                        + ") : onglet « Gourmandes ».");
             }
             if (unused > 0) {
                 tips.add(unused + " appli" + (unused > 1 ? "s inutiles" : " inutile")
                         + (unusedSize > 0 ? " (" + Formatter.formatShortFileSize(this, unusedSize) + " à récupérer)" : "")
-                        + " : voir l'onglet « Inutiles ».");
+                        + " : onglet « Inutiles ».");
+            }
+            if (bloat > 0) {
+                tips.add(bloat + " appli" + (bloat > 1 ? "s préinstallées" : " préinstallée")
+                        + " à désactiver (publicités, statistiques) : onglet « Préinstallées ».");
+            }
+            if (cacheTotal >= 2L * 1024 * 1024 * 1024) {
+                tips.add(Formatter.formatShortFileSize(this, cacheTotal) + " de cache : onglet « Cache ».");
+            }
+            if (side > 0) {
+                tips.add(side + " appli" + (side > 1 ? "s installées" : " installée")
+                        + " hors Play Store : vérifie que tu les connais.");
             }
         } else if (!usageGranted) {
             tips.add("Donne l'autorisation ci-dessous pour une analyse complète des applis.");
@@ -1036,44 +1329,75 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ liste des applis
 
+    private boolean matchesFilter(AppItem a) {
+        switch (filter) {
+            case FILTER_UNUSED: return isUnused(a);
+            case FILTER_IMPACT: return isGreedy(a);
+            case FILTER_PREINST: return isPreinstalledToShow(a);
+            case FILTER_HEAVY: return !a.system && a.size > 0;
+            case FILTER_CACHE: return !a.system && a.cache >= CACHE_MIN;
+            case FILTER_SIDELOAD: return isSideloaded(a);
+            default: return !a.system;
+        }
+    }
+
     private void renderApps() {
         appList.removeAllViews();
         final long now = System.currentTimeMillis();
 
         List<AppItem> shown = new ArrayList<>();
-        int unusedCount = 0, greedyCount = 0;
+        int userCount = 0, sysCount = 0, unusedCount = 0, greedyCount = 0;
         for (AppItem a : apps) {
-            boolean un = isUnused(a);
-            boolean gr = isGreedy(a);
-            if (un) unusedCount++;
-            if (gr) greedyCount++;
-            if (filter == FILTER_UNUSED && !un) continue;
-            if (filter == FILTER_IMPACT && !gr) continue;
+            if (a.system) sysCount++;
+            else userCount++;
+            if (isUnused(a)) unusedCount++;
+            if (isGreedy(a)) greedyCount++;
+            if (!matchesFilter(a)) continue;
+            if (!query.isEmpty() && !a.label.toLowerCase(Locale.ROOT).contains(query)
+                    && !a.pkg.toLowerCase(Locale.ROOT).contains(query)) continue;
             shown.add(a);
         }
 
-        if (filter == FILTER_IMPACT) {
-            shown.sort((x, y) -> Integer.compare(y.impact, x.impact));
-        } else if (filter == FILTER_HEAVY) {
-            shown.sort((x, y) -> Long.compare(y.size, x.size));
-            if (shown.size() > 25) shown = new ArrayList<>(shown.subList(0, 25));
-        } else if (filter == FILTER_UNUSED) {
-            shown.sort((x, y) -> Long.compare(y.size, x.size));
-        } else {
-            shown.sort((x, y) -> String.CASE_INSENSITIVE_ORDER.compare(x.label, y.label));
+        switch (filter) {
+            case FILTER_IMPACT:
+                shown.sort((x, y) -> Integer.compare(y.impact, x.impact));
+                break;
+            case FILTER_PREINST:
+                shown.sort((x, y) -> {
+                    if ((x.known != null) != (y.known != null)) return x.known != null ? -1 : 1;
+                    return Long.compare(x.lastUsed, y.lastUsed);
+                });
+                break;
+            case FILTER_HEAVY:
+            case FILTER_UNUSED:
+                shown.sort((x, y) -> Long.compare(y.size, x.size));
+                break;
+            case FILTER_CACHE:
+                shown.sort((x, y) -> Long.compare(y.cache, x.cache));
+                break;
+            default:
+                shown.sort((x, y) -> String.CASE_INSENSITIVE_ORDER.compare(x.label, y.label));
         }
 
-        String summary = apps.size() + " applis installées par toi";
+        String summary = userCount + " applis installées par toi · " + sysCount + " préinstallées";
         if (usageGranted) {
-            summary += " · " + unusedCount + " inutile" + (unusedCount > 1 ? "s" : "")
+            summary += "\n" + unusedCount + " inutile" + (unusedCount > 1 ? "s" : "")
                     + " · " + greedyCount + " gourmande" + (greedyCount > 1 ? "s" : "");
         }
+        if (!kept.isEmpty()) summary += " · " + kept.size() + " gardée" + (kept.size() > 1 ? "s" : "");
         appsSummary.setText(summary);
+
+        boolean preinst = filter == FILTER_PREINST;
+        uninstallBtn.setVisibility(preinst ? View.GONE : View.VISIBLE);
 
         if (shown.isEmpty()) {
             String msg;
-            if (filter == FILTER_UNUSED) msg = "Aucune appli oubliée. Bravo, ton téléphone est bien rangé !";
+            if (!query.isEmpty()) msg = "Aucune appli ne correspond à « " + query + " » dans cet onglet.";
+            else if (filter == FILTER_UNUSED) msg = "Aucune appli oubliée. Bravo, ton téléphone est bien rangé !";
             else if (filter == FILTER_IMPACT) msg = "Aucune appli ne tourne trop en arrière-plan. Parfait !";
+            else if (filter == FILTER_PREINST) msg = "Aucune appli préinstallée à désactiver.";
+            else if (filter == FILTER_CACHE) msg = "Aucune appli n'accumule beaucoup de cache.";
+            else if (filter == FILTER_SIDELOAD) msg = "Toutes tes applis viennent d'une boutique officielle.";
             else msg = "Aucune appli à afficher.";
             TextView empty = text(msg, 14, cSub, false);
             empty.setPadding(0, px(12), 0, px(4));
@@ -1100,15 +1424,19 @@ public class MainActivity extends Activity {
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(0, px(8), 0, px(8));
 
-        CheckBox cb = new CheckBox(this);
-        cb.setChecked(selected.contains(a.pkg));
-        cb.setButtonTintList(ColorStateList.valueOf(cAccent));
-        cb.setOnCheckedChangeListener((b, checked) -> {
-            if (checked) selected.add(a.pkg);
-            else selected.remove(a.pkg);
-            updateUninstallButton();
-        });
-        row.addView(cb);
+        CheckBox cb = null;
+        if (!a.system) {
+            final CheckBox box = new CheckBox(this);
+            box.setChecked(selected.contains(a.pkg));
+            box.setButtonTintList(ColorStateList.valueOf(cAccent));
+            box.setOnCheckedChangeListener((b, checked) -> {
+                if (checked) selected.add(a.pkg);
+                else selected.remove(a.pkg);
+                updateUninstallButton();
+            });
+            row.addView(box);
+            cb = box;
+        }
 
         ImageView icon = new ImageView(this);
         if (a.icon != null) icon.setImageDrawable(a.icon);
@@ -1128,16 +1456,34 @@ public class MainActivity extends Activity {
 
         StringBuilder d = new StringBuilder();
         if (a.size > 0) d.append(Formatter.formatShortFileSize(this, a.size));
+        if (a.cache >= CACHE_MIN) {
+            if (d.length() > 0) d.append(" · ");
+            d.append("cache ").append(Formatter.formatShortFileSize(this, a.cache));
+        }
         if (usageGranted) {
             if (d.length() > 0) d.append(" · ");
             d.append(lastUsedText(a, now));
+        }
+        if (isKept(a)) {
+            if (d.length() > 0) d.append(" · ");
+            d.append("gardée");
         }
         if (d.length() > 0) texts.addView(text(d.toString(), 12, cSub, false));
 
         // Raisons affichées selon l'onglet
         List<String> reasons = new ArrayList<>();
+        if (filter == FILTER_PREINST) {
+            reasons.add(a.known != null ? a.known : "Préinstallée : désactive-la si tu ne t'en sers pas");
+            if (a.unusedReason != null && usageGranted) reasons.add(a.unusedReason);
+        }
         if ((filter == FILTER_UNUSED || filter == FILTER_ALL) && isUnused(a)) reasons.add(a.unusedReason);
-        if ((filter == FILTER_IMPACT || filter == FILTER_ALL) && isGreedy(a)) reasons.addAll(a.heatReasons);
+        if ((filter == FILTER_IMPACT || filter == FILTER_ALL) && isGreedy(a)) {
+            if (a.system && a.known != null) reasons.add("Préinstallée : " + a.known);
+            reasons.addAll(a.heatReasons);
+        }
+        if ((filter == FILTER_SIDELOAD || filter == FILTER_ALL) && isSideloaded(a)) {
+            reasons.add("Installée depuis : " + a.sideloadFrom);
+        }
         for (String r : reasons) {
             TextView rt = text("•  " + r, 12, cWarn, true);
             rt.setPadding(0, px(2), 0, 0);
@@ -1145,18 +1491,52 @@ public class MainActivity extends Activity {
         }
         row.addView(texts);
 
-        TextView info = text("Infos", 13, cAccent, true);
+        TextView info = text(a.system ? "Désactiver" : "Infos", 13, cAccent, true);
         info.setPadding(px(10), px(8), px(4), px(8));
-        info.setOnClickListener(v -> openAppInfo(a.pkg));
+        info.setOnClickListener(v -> showOptions(a));
         row.addView(info);
 
-        row.setOnClickListener(v -> cb.setChecked(!cb.isChecked()));
+        if (cb != null) {
+            final CheckBox box = cb;
+            row.setOnClickListener(v -> box.setChecked(!box.isChecked()));
+        } else {
+            row.setOnClickListener(v -> showOptions(a));
+        }
 
         LinearLayout wrap = new LinearLayout(this);
         wrap.setOrientation(LinearLayout.VERTICAL);
         if (appList.getChildCount() > 0) wrap.addView(divider());
         wrap.addView(row);
         return wrap;
+    }
+
+    /** Fenêtre d'options d'une appli : fiche Android ou « garder ». */
+    private void showOptions(AppItem a) {
+        boolean k = isKept(a);
+        String first = a.system ? "Ouvrir la fiche Android (pour la désactiver)"
+                : "Ouvrir la fiche Android (cache, batterie, arrêt)";
+        String second = k ? "Ne plus la garder (la signaler à nouveau)" : "La garder (ne plus la signaler)";
+        new AlertDialog.Builder(this)
+                .setTitle(a.label)
+                .setItems(new CharSequence[]{first, second}, (dlg, which) -> {
+                    if (which == 0) {
+                        openAppInfo(a.pkg);
+                    } else {
+                        if (k) kept.remove(a.pkg);
+                        else {
+                            kept.add(a.pkg);
+                            selected.remove(a.pkg);
+                        }
+                        prefs.edit().putStringSet("kept", new HashSet<>(kept)).apply();
+                        Toast.makeText(this, k ? a.label + " sera de nouveau signalée."
+                                : a.label + " est gardée : elle n'apparaîtra plus dans les alertes.",
+                                Toast.LENGTH_SHORT).show();
+                        renderApps();
+                        updateScore();
+                    }
+                })
+                .setNegativeButton("Fermer", null)
+                .show();
     }
 
     private String lastUsedText(AppItem a, long now) {
@@ -1230,6 +1610,100 @@ public class MainActivity extends Activity {
             startActivityForResult(i, REQ_UNINSTALL);
         } catch (Exception e) {
             launchNextUninstall();
+        }
+    }
+
+    // ------------------------------------------------------------------ courbe de température
+
+    /** Petite courbe de la température de la batterie, avec la ligne des 38 °C. */
+    static class TempChart extends View {
+        private long[] times = new long[0];
+        private float[] temps = new float[0];
+        private final float dp;
+        private final int line, grid, hot, label;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+
+        TempChart(Context c, float dp, int line, int grid, int hot, int label) {
+            super(c);
+            this.dp = dp;
+            this.line = line;
+            this.grid = grid;
+            this.hot = hot;
+            this.label = label;
+        }
+
+        void setData(long[] t, float[] v) {
+            times = t;
+            temps = v;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas cv) {
+            super.onDraw(cv);
+            if (temps.length < 2) return;
+            float w = getWidth(), h = getHeight();
+            float left = 32 * dp, bottom = h - 16 * dp, top = 6 * dp;
+
+            float min = temps[0], max = temps[0];
+            for (float v : temps) {
+                min = Math.min(min, v);
+                max = Math.max(max, v);
+            }
+            min = (float) Math.floor(Math.min(min, 30f) / 5f) * 5f;
+            max = (float) Math.ceil(Math.max(max, 40f) / 5f) * 5f;
+            long t0 = times[0], t1 = Math.max(times[times.length - 1], t0 + 1);
+
+            paint.setTextSize(10 * dp);
+            paint.setStyle(Paint.Style.FILL);
+            for (float g = min; g <= max + 0.01f; g += 5f) {
+                float y = yOf(g, min, max, top, bottom);
+                paint.setColor(grid);
+                paint.setStrokeWidth(Math.max(1f, dp));
+                cv.drawLine(left, y, w, y, paint);
+                paint.setColor(label);
+                cv.drawText(Math.round(g) + "°", 0, y + 3.5f * dp, paint);
+            }
+
+            float yHot = yOf(38f, min, max, top, bottom);
+            paint.setColor(hot);
+            paint.setStrokeWidth(1.5f * dp);
+            paint.setPathEffect(new DashPathEffect(new float[]{6 * dp, 4 * dp}, 0));
+            cv.drawLine(left, yHot, w, yHot, paint);
+            paint.setPathEffect(null);
+
+            path.reset();
+            for (int i = 0; i < temps.length; i++) {
+                float x = left + (w - left) * (times[i] - t0) / (float) (t1 - t0);
+                float y = yOf(temps[i], min, max, top, bottom);
+                if (i == 0) path.moveTo(x, y);
+                else path.lineTo(x, y);
+            }
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setColor(line);
+            paint.setStrokeWidth(2 * dp);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+            cv.drawPath(path, paint);
+
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(hot);
+            for (int i = 0; i < temps.length; i++) {
+                if (temps[i] < 38f) continue;
+                float x = left + (w - left) * (times[i] - t0) / (float) (t1 - t0);
+                cv.drawCircle(x, yOf(temps[i], min, max, top, bottom), 3 * dp, paint);
+            }
+
+            paint.setColor(label);
+            long spanH = (t1 - t0) / (60L * 60 * 1000);
+            String start = spanH >= 48 ? "il y a " + (spanH / 24) + " j" : "il y a " + Math.max(1, spanH) + " h";
+            cv.drawText(start, left, h - 2 * dp, paint);
+            String end = "maintenant";
+            cv.drawText(end, w - paint.measureText(end), h - 2 * dp, paint);
+        }
+
+        private static float yOf(float v, float min, float max, float top, float bottom) {
+            return bottom - (bottom - top) * (v - min) / (max - min);
         }
     }
 }
