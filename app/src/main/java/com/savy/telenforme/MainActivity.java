@@ -11,6 +11,8 @@ import android.app.usage.StorageStatsManager;
 import android.app.usage.UsageStats;
 import android.app.usage.UsageStatsManager;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -124,6 +126,12 @@ public class MainActivity extends Activity {
         int uid;
         boolean system;      // préinstallée (non supprimable)
         String known;        // description si c'est une appli préinstallée connue
+        Bloat.Info info;     // niveau de risque si préinstallée connue
+        boolean launcher = true; // a une icône sur l'écran d'accueil
+        int category = -1;
+        Advice.Tip tip;      // réglage batterie conseillé
+        long tunedAt = 0;    // date à laquelle l'utilisateur a appliqué le réglage
+        long bgBeforePerDay = -1, bgAfterPerDay = -1;
         long size = -1;
         long cache = -1;
         long lastUsed = 0;
@@ -150,7 +158,7 @@ public class MainActivity extends Activity {
     private TextView appsSummary, filterHint, hotTitle, histSummary;
     private LinearLayout tipsBox, appList, permCard, hotCard, hotList, histApps;
     private TempChart histChart;
-    private Button uninstallBtn;
+    private Button uninstallBtn, adbBtn;
     private Switch remindSwitch;
     private final TextView[] chips = new TextView[7];
 
@@ -185,6 +193,9 @@ public class MainActivity extends Activity {
         setupColors();
         buildUi();
         HeatJob.schedule(this);
+        final Context app = getApplicationContext();
+        final Set<String> k0 = new HashSet<>(kept);
+        exec.submit(() -> Snapshot.ensureBaseline(app, k0));
     }
 
     @Override
@@ -434,6 +445,8 @@ public class MainActivity extends Activity {
         // --- Entretien rapide
         root.addView(sectionTitle("Entretien rapide"));
         LinearLayout maint = card();
+        addAction(maint, "Points de restauration", "Revenir en arrière après une modification",
+                new Intent(this, RestoreActivity.class));
         addAction(maint, "Stockage", "Voir ce qui prend de la place (photos, fichiers, cache)",
                 new Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS));
         addAction(maint, "Batterie", "Voir quelles applis consomment le plus selon Android",
@@ -542,6 +555,10 @@ public class MainActivity extends Activity {
         uninstallBtn = button("Désinstaller la sélection", true);
         uninstallBtn.setOnClickListener(v -> confirmUninstall());
         appsCard.addView(uninstallBtn);
+        adbBtn = button("Retirer avec le PC (sans risque, réversible)", false);
+        adbBtn.setOnClickListener(v -> showAdb());
+        adbBtn.setVisibility(View.GONE);
+        appsCard.addView(adbBtn);
 
         appList = new LinearLayout(this);
         appList.setOrientation(LinearLayout.VERTICAL);
@@ -838,10 +855,12 @@ public class MainActivity extends Activity {
         Map<String, Long> recentFgs = new HashMap<>();
         StorageStatsManager ssm = null;
         PowerManager power = null;
+        UsageStatsManager usm = null;
+        Map<String, String> tuned = tunedMap();
 
         if (granted) {
             try {
-                UsageStatsManager usm = getSystemService(UsageStatsManager.class);
+                usm = getSystemService(UsageStatsManager.class);
                 usageAll = aggregate(usm, now - 400 * DAY, now);
                 usage7 = aggregate(usm, now - 7 * DAY, now);
                 usage30 = aggregate(usm, now - 30 * DAY, now);
@@ -869,11 +888,11 @@ public class MainActivity extends Activity {
         for (ApplicationInfo ai : list) {
             if (ai.packageName.equals(getPackageName())) continue;
             boolean system = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
-            String known = null;
+            Bloat.Info info = null;
             if (system) {
                 if (!ai.enabled) continue; // déjà désactivée
-                known = Bloat.KNOWN.get(ai.packageName);
-                if (known == null) {
+                info = Bloat.known(ai.packageName);
+                if (info == null) {
                     if (Bloat.isEssential(ai.packageName)) continue;
                     if (pm.getLaunchIntentForPackage(ai.packageName) == null) continue; // service invisible
                 }
@@ -883,7 +902,10 @@ public class MainActivity extends Activity {
             it.pkg = ai.packageName;
             it.uid = ai.uid;
             it.system = system;
-            it.known = known;
+            it.info = info;
+            it.known = info != null ? info.desc : null;
+            it.category = ai.category;
+            if (!system) it.launcher = pm.getLaunchIntentForPackage(ai.packageName) != null;
             try {
                 it.label = ai.loadLabel(pm).toString();
             } catch (Exception e) {
@@ -944,6 +966,22 @@ public class MainActivity extends Activity {
 
             if (!system) it.sideloadFrom = sideloadSource(pm, ai.packageName);
 
+            String t = tuned.get(ai.packageName);
+            if (t != null) {
+                try {
+                    String[] parts = t.split("\\|");
+                    it.tunedAt = Long.parseLong(parts[0]);
+                    it.bgBeforePerDay = Long.parseLong(parts[1]);
+                    long days = (now - it.tunedAt) / DAY;
+                    if (days >= 2 && usm != null && Build.VERSION.SDK_INT >= 29) {
+                        UsageStats since = aggregate(usm, it.tunedAt + DAY, now).get(ai.packageName);
+                        long fgsSince = since == null ? 0 : since.getTotalTimeForegroundServiceUsed();
+                        it.bgAfterPerDay = fgsSince / Math.max(1, days - 1);
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+
             if (granted) {
                 computeImpact(it);
                 it.unusedReason = unusedReason(it, now);
@@ -987,9 +1025,11 @@ public class MainActivity extends Activity {
             a.heatReasons.add("Se lance toute seule au démarrage");
         }
         a.impact = score;
+        a.tip = Advice.recommend(a.pkg, a.category, a.fg7, a.fgs7);
     }
 
     private String unusedReason(AppItem a, long now) {
+        if (!a.system && !a.launcher) return null; // service, clavier, extension : jamais « ouverts »
         if (a.installed > 0 && now - a.installed < UNUSED_DAYS * DAY) return null; // installée récemment
         if (a.lastUsed <= 0) return a.system ? "Jamais utilisée d'après Android" : "Jamais ouverte d'après Android";
         long days = (now - a.lastUsed) / DAY;
@@ -1013,7 +1053,9 @@ public class MainActivity extends Activity {
     }
 
     private boolean isGreedy(AppItem a) {
-        return usageGranted && !isKept(a) && a.impact >= IMPACT_THRESHOLD && (!a.system || a.known != null);
+        if (!usageGranted || isKept(a) || a.impact < IMPACT_THRESHOLD) return false;
+        if (a.system && (a.info == null || a.info.level == Bloat.KEEP)) return false;
+        return !tunedWorks(a);
     }
 
     private boolean isPreinstalledToShow(AppItem a) {
@@ -1279,7 +1321,7 @@ public class MainActivity extends Activity {
                     if (a.size > 0) unusedSize += a.size;
                 }
                 if (isGreedy(a)) greedy++;
-                if (a.system && a.known != null && !isKept(a)) bloat++;
+                if (a.system && a.info != null && a.info.level == Bloat.SAFE && !isKept(a)) bloat++;
                 if (isSideloaded(a)) side++;
                 if (!a.system && a.cache > 0) cacheTotal += a.cache;
             }
@@ -1332,7 +1374,7 @@ public class MainActivity extends Activity {
     private boolean matchesFilter(AppItem a) {
         switch (filter) {
             case FILTER_UNUSED: return isUnused(a);
-            case FILTER_IMPACT: return isGreedy(a);
+            case FILTER_IMPACT: return isGreedy(a) || (a.tunedAt > 0 && !isKept(a));
             case FILTER_PREINST: return isPreinstalledToShow(a);
             case FILTER_HEAVY: return !a.system && a.size > 0;
             case FILTER_CACHE: return !a.system && a.cache >= CACHE_MIN;
@@ -1364,7 +1406,9 @@ public class MainActivity extends Activity {
                 break;
             case FILTER_PREINST:
                 shown.sort((x, y) -> {
-                    if ((x.known != null) != (y.known != null)) return x.known != null ? -1 : 1;
+                    int lx = x.info != null ? x.info.level : Bloat.UNKNOWN;
+                    int ly = y.info != null ? y.info.level : Bloat.UNKNOWN;
+                    if (lx != ly) return Integer.compare(lx, ly);
                     return Long.compare(x.lastUsed, y.lastUsed);
                 });
                 break;
@@ -1389,6 +1433,7 @@ public class MainActivity extends Activity {
 
         boolean preinst = filter == FILTER_PREINST;
         uninstallBtn.setVisibility(preinst ? View.GONE : View.VISIBLE);
+        adbBtn.setVisibility(preinst && usageGranted ? View.VISIBLE : View.GONE);
 
         if (shown.isEmpty()) {
             String msg;
@@ -1473,13 +1518,23 @@ public class MainActivity extends Activity {
         // Raisons affichées selon l'onglet
         List<String> reasons = new ArrayList<>();
         if (filter == FILTER_PREINST) {
-            reasons.add(a.known != null ? a.known : "Préinstallée : désactive-la si tu ne t'en sers pas");
+            int lvl = a.info != null ? a.info.level : Bloat.UNKNOWN;
+            reasons.add(Bloat.levelName(lvl) + (a.known != null ? " : " + a.known : ""));
+            if (a.info != null && a.info.loss != null) reasons.add("Tu perdras : " + a.info.loss);
             if (a.unusedReason != null && usageGranted) reasons.add(a.unusedReason);
         }
         if ((filter == FILTER_UNUSED || filter == FILTER_ALL) && isUnused(a)) reasons.add(a.unusedReason);
         if ((filter == FILTER_IMPACT || filter == FILTER_ALL) && isGreedy(a)) {
             if (a.system && a.known != null) reasons.add("Préinstallée : " + a.known);
             reasons.addAll(a.heatReasons);
+        }
+        if (filter == FILTER_IMPACT && a.tip != null) {
+            String st = tunedStatus(a);
+            if (st != null) reasons.add(st);
+            else reasons.add("Réglage conseillé : « " + Advice.name(a.tip.level) + " » (touche « Régler »)");
+        }
+        if (filter == FILTER_ALL && !a.system && !a.launcher) {
+            reasons.add("Sans icône : service, clavier ou extension. Ne la supprime que si tu sais ce que c'est");
         }
         if ((filter == FILTER_SIDELOAD || filter == FILTER_ALL) && isSideloaded(a)) {
             reasons.add("Installée depuis : " + a.sideloadFrom);
@@ -1491,7 +1546,8 @@ public class MainActivity extends Activity {
         }
         row.addView(texts);
 
-        TextView info = text(a.system ? "Désactiver" : "Infos", 13, cAccent, true);
+        String act = a.system ? "Que faire ?" : (filter == FILTER_IMPACT && a.tip != null ? "Régler" : "Infos");
+        TextView info = text(act, 13, cAccent, true);
         info.setPadding(px(10), px(8), px(4), px(8));
         info.setOnClickListener(v -> showOptions(a));
         row.addView(info);
@@ -1510,33 +1566,219 @@ public class MainActivity extends Activity {
         return wrap;
     }
 
-    /** Fenêtre d'options d'une appli : fiche Android ou « garder ». */
+    /** Fenêtre d'options d'une appli : conseils adaptés, fiche Android ou « garder ». */
     private void showOptions(AppItem a) {
+        if (a.system) {
+            showSystemAdvice(a);
+            return;
+        }
+        if (a.tip != null && (filter == FILTER_IMPACT || isGreedy(a))) {
+            showBatteryAdvice(a);
+            return;
+        }
         boolean k = isKept(a);
-        String first = a.system ? "Ouvrir la fiche Android (pour la désactiver)"
-                : "Ouvrir la fiche Android (cache, batterie, arrêt)";
+        String first = "Ouvrir la fiche Android (cache, batterie, arrêt)";
         String second = k ? "Ne plus la garder (la signaler à nouveau)" : "La garder (ne plus la signaler)";
+        String third = "Réglage batterie conseillé";
+        CharSequence[] items = a.tip != null ? new CharSequence[]{first, second, third}
+                : new CharSequence[]{first, second};
         new AlertDialog.Builder(this)
                 .setTitle(a.label)
-                .setItems(new CharSequence[]{first, second}, (dlg, which) -> {
-                    if (which == 0) {
-                        openAppInfo(a.pkg);
-                    } else {
-                        if (k) kept.remove(a.pkg);
-                        else {
-                            kept.add(a.pkg);
-                            selected.remove(a.pkg);
-                        }
-                        prefs.edit().putStringSet("kept", new HashSet<>(kept)).apply();
-                        Toast.makeText(this, k ? a.label + " sera de nouveau signalée."
-                                : a.label + " est gardée : elle n'apparaîtra plus dans les alertes.",
-                                Toast.LENGTH_SHORT).show();
-                        renderApps();
-                        updateScore();
-                    }
+                .setItems(items, (dlg, which) -> {
+                    if (which == 0) openAppInfo(a.pkg);
+                    else if (which == 1) toggleKept(a);
+                    else showBatteryAdvice(a);
                 })
                 .setNegativeButton("Fermer", null)
                 .show();
+    }
+
+    private void toggleKept(AppItem a) {
+        boolean k = isKept(a);
+        if (k) kept.remove(a.pkg);
+        else {
+            kept.add(a.pkg);
+            selected.remove(a.pkg);
+        }
+        prefs.edit().putStringSet("kept", new HashSet<>(kept)).apply();
+        Toast.makeText(this, k ? a.label + " sera de nouveau signalée."
+                : a.label + " est gardée : elle n'apparaîtra plus dans les alertes.", Toast.LENGTH_SHORT).show();
+        renderApps();
+        updateScore();
+    }
+
+    // ------------------------------------------------------------------ conseils batterie
+
+    /** Applis réglées par l'utilisateur : paquet → « date|arrière-plan par jour avant ». */
+    private Map<String, String> tunedMap() {
+        Map<String, String> m = new HashMap<>();
+        for (String e : prefs.getStringSet("tuned", Collections.emptySet())) {
+            int i = e.indexOf('|');
+            if (i > 0) m.put(e.substring(0, i), e.substring(i + 1));
+        }
+        return m;
+    }
+
+    private void markTuned(AppItem a) {
+        Set<String> set = new HashSet<>();
+        for (String e : prefs.getStringSet("tuned", Collections.emptySet())) {
+            if (!e.startsWith(a.pkg + "|")) set.add(e);
+        }
+        set.add(a.pkg + "|" + System.currentTimeMillis() + "|" + (a.fgs7 / 7));
+        prefs.edit().putStringSet("tuned", set).apply();
+        Toast.makeText(this, "Noté. Dans 2 jours, tu verras ici si " + a.label + " tourne moins en fond.",
+                Toast.LENGTH_LONG).show();
+        refresh();
+    }
+
+    /** Le réglage a-t-il fait baisser nettement le temps passé en fond ? */
+    private boolean tunedWorks(AppItem a) {
+        if (a.tunedAt <= 0 || a.bgAfterPerDay < 0) return false;
+        return a.bgAfterPerDay < 10 * MIN || (a.bgBeforePerDay > 0 && a.bgAfterPerDay <= a.bgBeforePerDay / 2);
+    }
+
+    private String tunedStatus(AppItem a) {
+        if (a.tunedAt <= 0) return null;
+        long days = (System.currentTimeMillis() - a.tunedAt) / DAY;
+        if (a.bgAfterPerDay < 0) {
+            return "Réglée " + (days <= 0 ? "aujourd'hui" : "il y a " + days + " j")
+                    + " : résultat visible après 2 jours";
+        }
+        String after = duration(a.bgAfterPerDay) + "/jour";
+        String before = a.bgBeforePerDay > 0 ? duration(a.bgBeforePerDay) + "/jour" : "?";
+        if (tunedWorks(a)) return "Réglage efficace : en fond " + after + " au lieu de " + before;
+        return "Réglage sans effet : toujours " + after + " en fond (avant " + before
+                + "). Essaie « " + Advice.name(Advice.RESTRICTED) + " » ou supprime-la";
+    }
+
+    private void showBatteryAdvice(AppItem a) {
+        Advice.Tip tip = a.tip != null ? a.tip : Advice.recommend(a.pkg, a.category, a.fg7, a.fgs7);
+        StringBuilder m = new StringBuilder();
+        m.append("Réglage conseillé : « ").append(Advice.name(tip.level)).append(" »\n\n");
+        m.append("Pourquoi : ").append(tip.why).append("\n\n");
+        m.append("Ce que ça change : ").append(Advice.effect(tip.level)).append("\n\n");
+        if (a.noOptim && tip.level != Advice.UNRESTRICTED) {
+            m.append("Actuellement, elle est en « ").append(Advice.name(Advice.UNRESTRICTED))
+                    .append(" » : c'est trop permissif pour elle.\n\n");
+        }
+        m.append("Comment faire : ").append(Advice.steps(tip.level)).append("\n\n");
+        m.append("Ensuite, reviens ici et touche « J'ai réglé » : Tél en forme vérifiera dans 2 jours ")
+                .append("qu'elle tourne vraiment moins. Un point de restauration est créé avant.");
+        String st = tunedStatus(a);
+        if (st != null) m.append("\n\nSuivi : ").append(st).append(".");
+        new AlertDialog.Builder(this)
+                .setTitle(a.label)
+                .setMessage(m.toString())
+                .setPositiveButton("Ouvrir la fiche", (d, w) ->
+                        withRestorePoint("Avant le réglage batterie de " + a.label, 10 * MIN,
+                                () -> openAppInfo(a.pkg)))
+                .setNeutralButton("J'ai réglé", (d, w) -> markTuned(a))
+                .setNegativeButton(isKept(a) ? "Ne plus garder" : "Garder telle quelle", (d, w) -> toggleKept(a))
+                .show();
+    }
+
+    // ------------------------------------------------------------------ applis préinstallées
+
+    private void showSystemAdvice(AppItem a) {
+        int lvl = a.info != null ? a.info.level : Bloat.UNKNOWN;
+        StringBuilder m = new StringBuilder();
+        m.append(Bloat.levelName(lvl)).append(".\n");
+        if (a.known != null) m.append(a.known).append(".\n");
+        if (a.info != null && a.info.loss != null) m.append("Tu perdras : ").append(a.info.loss).append(".\n");
+        m.append('\n');
+        switch (lvl) {
+            case Bloat.SAFE:
+            case Bloat.LOSS:
+                m.append("1. Touche « Ouvrir la fiche », puis « Désactiver ».\n\n")
+                        .append("2. Si « Désactiver » est grisé ou absent (Xiaomi le bloque souvent) : sur la même ")
+                        .append("fiche, coupe ses « Notifications » et règle « Économiseur de batterie » sur « ")
+                        .append(Advice.name(Advice.RESTRICTED)).append(" ». Elle ne te dérangera plus et ne ")
+                        .append("consommera presque plus, sans aucun risque.\n\n")
+                        .append("3. Pour la retirer complètement : bouton « Retirer avec le PC » en haut de l'onglet ")
+                        .append("(sans risque et réversible).");
+                break;
+            case Bloat.KEEP:
+                m.append("Ne la désactive pas : le téléphone en a besoin. Touche « La garder » pour qu'elle ne ")
+                        .append("soit plus signalée.");
+                break;
+            default:
+                m.append("Je ne connais pas cette appli. Dans le doute, ne la désactive pas : touche « La garder ». ")
+                        .append("Si tu veux quand même, cherche d'abord son nom sur internet (")
+                        .append(a.pkg).append(").");
+        }
+        m.append("\n\nUn point de restauration est créé avant d'ouvrir la fiche.");
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle(a.label)
+                .setMessage(m.toString())
+                .setNegativeButton(isKept(a) ? "Ne plus garder" : "La garder", (d, w) -> toggleKept(a))
+                .setNeutralButton("Fermer", null);
+        if (lvl != Bloat.KEEP) {
+            b.setPositiveButton("Ouvrir la fiche", (d, w) ->
+                    withRestorePoint("Avant la désactivation de " + a.label, 10 * MIN, () -> openAppInfo(a.pkg)));
+        }
+        b.show();
+    }
+
+    /** Commandes PC (ADB) pour retirer les préinstallées sans risque, avec la marche à suivre. */
+    private void showAdb() {
+        StringBuilder cmds = new StringBuilder();
+        StringBuilder names = new StringBuilder();
+        int n = 0;
+        for (AppItem a : apps) {
+            if (!a.system || a.info == null || a.info.level != Bloat.SAFE || isKept(a)) continue;
+            cmds.append("adb shell pm uninstall --user 0 ").append(a.pkg).append('\n');
+            if (names.length() > 0) names.append(", ");
+            names.append(a.label);
+            n++;
+        }
+        if (n == 0) {
+            Toast.makeText(this, "Aucune appli préinstallée « sans risque » à retirer.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final String text = cmds.toString();
+        String msg = n + " appli" + (n > 1 ? "s" : "") + " sans risque : " + names + ".\n\n"
+                + "Une seule fois :\n"
+                + "1. Paramètres → À propos du téléphone : touche 7 fois « Version de HyperOS » (ou « Version MIUI »).\n"
+                + "2. Paramètres → Paramètres supplémentaires → Options pour les développeurs : active « Débogage USB ».\n"
+                + "3. Sur le PC, télécharge « SDK Platform-Tools » sur le site de Google (developer.android.com), "
+                + "décompresse-le, ouvre le dossier, tape « cmd » dans la barre d'adresse et appuie sur Entrée.\n"
+                + "4. Branche le téléphone et accepte « Autoriser le débogage USB ».\n\n"
+                + "Ensuite : touche « Copier les commandes », envoie-les sur ton PC (e-mail, WhatsApp Web…) et "
+                + "colle-les dans la fenêtre noire.\n\n"
+                + "C'est réversible : les applis restent dans le téléphone et le point de restauration créé "
+                + "maintenant te donnera les commandes pour les remettre.";
+        withRestorePoint("Avant de retirer des applis avec le PC", 0, () -> new AlertDialog.Builder(this)
+                .setTitle("Retirer avec le PC")
+                .setMessage(msg)
+                .setPositiveButton("Copier les commandes", (d, w) -> copy(text))
+                .setNegativeButton("Fermer", null)
+                .show());
+    }
+
+    private void copy(String s) {
+        try {
+            ClipboardManager cm = getSystemService(ClipboardManager.class);
+            cm.setPrimaryClip(ClipData.newPlainText("Commandes ADB", s));
+            Toast.makeText(this, "Commandes copiées.", Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Copie impossible.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ------------------------------------------------------------------ points de restauration
+
+    /** Crée un point de restauration (si le dernier date de plus de maxAge), puis lance l'action. */
+    private void withRestorePoint(String reason, long maxAge, Runnable then) {
+        final Context app = getApplicationContext();
+        final Set<String> k = new HashSet<>(kept);
+        exec.submit(() -> {
+            boolean made = Snapshot.createIfStale(app, reason, k, maxAge);
+            ui.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (made) Toast.makeText(this, "Point de restauration créé.", Toast.LENGTH_SHORT).show();
+                then.run();
+            });
+        });
     }
 
     private String lastUsedText(AppItem a, long now) {
@@ -1579,7 +1821,9 @@ public class MainActivity extends Activity {
                 .setTitle("Désinstaller " + i + " appli" + (i > 1 ? "s" : "") + " ?")
                 .setMessage(names.toString())
                 .setNegativeButton("Annuler", null)
-                .setPositiveButton("Continuer", (dlg, w) -> startUninstall())
+                .setPositiveButton("Continuer", (dlg, w) -> withRestorePoint(
+                        "Avant la désinstallation de " + selected.size() + " appli" + (selected.size() > 1 ? "s" : ""),
+                        0, this::startUninstall))
                 .show();
     }
 
