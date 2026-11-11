@@ -33,6 +33,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".RestoreActivity"
+            android:exported="false"
+            android:label="Points de restauration"
+            android:screenOrientation="portrait"
+            tools:ignore="LockedOrientationActivity" />
+
         <service
             android:name=".HeatJob"
             android:exported="false"
